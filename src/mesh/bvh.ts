@@ -1,0 +1,120 @@
+// A compact binary BVH built on the CPU and flattened for GPU traversal.
+//
+// Input is a triangle buffer (AoS, `stride` floats per triangle, positions in
+// the first three vec4 slots). Output is a flat node array plus the triangles
+// reordered into BVH leaf order, so a leaf can reference a contiguous range
+// directly — no indirection buffer needed on the GPU.
+//
+// Node layout (8 floats):
+//   [minX, minY, minZ, A,  maxX, maxY, maxZ, B]
+//   leaf     → B = count  > 0, A = first triangle index
+//   internal → B = -(rightChild + 1) (< 0), A = left child node index
+//   (right child index is stored explicitly — the left subtree is allocated
+//    between this node and its right child, so right ≠ left + 1.)
+
+export interface BVHResult {
+  nodes: Float32Array<ArrayBuffer>;
+  tris: Float32Array<ArrayBuffer>; // reordered into leaf order
+  nodeCount: number;
+}
+
+const LEAF_SIZE = 4;
+
+export function buildBVH(triData: Float32Array, stride: number): BVHResult {
+  const triCount = Math.floor(triData.length / stride);
+  if (triCount === 0) {
+    return { nodes: new Float32Array(8), tris: new Float32Array(0), nodeCount: 1 };
+  }
+
+  const idx = new Uint32Array(triCount);
+  const cent = new Float32Array(triCount * 3);
+  const tmin = new Float32Array(triCount * 3);
+  const tmax = new Float32Array(triCount * 3);
+
+  for (let t = 0; t < triCount; t++) {
+    idx[t] = t;
+    const o = t * stride;
+    let lx = Infinity, ly = Infinity, lz = Infinity;
+    let hx = -Infinity, hy = -Infinity, hz = -Infinity;
+    for (let v = 0; v < 3; v++) {
+      const p = o + v * 4; // p0,p1,p2 live in vec4 slots 0,1,2
+      const x = triData[p], y = triData[p + 1], z = triData[p + 2];
+      lx = Math.min(lx, x); ly = Math.min(ly, y); lz = Math.min(lz, z);
+      hx = Math.max(hx, x); hy = Math.max(hy, y); hz = Math.max(hz, z);
+    }
+    tmin[t * 3] = lx; tmin[t * 3 + 1] = ly; tmin[t * 3 + 2] = lz;
+    tmax[t * 3] = hx; tmax[t * 3 + 1] = hy; tmax[t * 3 + 2] = hz;
+    cent[t * 3] = (lx + hx) * 0.5;
+    cent[t * 3 + 1] = (ly + hy) * 0.5;
+    cent[t * 3 + 2] = (lz + hz) * 0.5;
+  }
+
+  const nodes: number[] = [];
+
+  function bounds(start: number, end: number) {
+    let lx = Infinity, ly = Infinity, lz = Infinity;
+    let hx = -Infinity, hy = -Infinity, hz = -Infinity;
+    for (let i = start; i < end; i++) {
+      const t = idx[i];
+      lx = Math.min(lx, tmin[t * 3]); ly = Math.min(ly, tmin[t * 3 + 1]); lz = Math.min(lz, tmin[t * 3 + 2]);
+      hx = Math.max(hx, tmax[t * 3]); hy = Math.max(hy, tmax[t * 3 + 1]); hz = Math.max(hz, tmax[t * 3 + 2]);
+    }
+    return { lx, ly, lz, hx, hy, hz };
+  }
+
+  function build(start: number, end: number): number {
+    const ni = nodes.length / 8;
+    for (let k = 0; k < 8; k++) nodes.push(0);
+    const b = bounds(start, end);
+    const count = end - start;
+
+    const writeAABB = (leftFirst: number, cnt: number) => {
+      const o = ni * 8;
+      nodes[o] = b.lx; nodes[o + 1] = b.ly; nodes[o + 2] = b.lz; nodes[o + 3] = leftFirst;
+      nodes[o + 4] = b.hx; nodes[o + 5] = b.hy; nodes[o + 6] = b.hz; nodes[o + 7] = cnt;
+    };
+
+    if (count <= LEAF_SIZE) {
+      writeAABB(start, count);
+      return ni;
+    }
+
+    // Split on the longest axis of the centroid bounds, at its midpoint.
+    let cl = [Infinity, Infinity, Infinity];
+    let ch = [-Infinity, -Infinity, -Infinity];
+    for (let i = start; i < end; i++) {
+      const t = idx[i];
+      for (let a = 0; a < 3; a++) {
+        cl[a] = Math.min(cl[a], cent[t * 3 + a]);
+        ch[a] = Math.max(ch[a], cent[t * 3 + a]);
+      }
+    }
+    let axis = 0;
+    if (ch[1] - cl[1] > ch[axis] - cl[axis]) axis = 1;
+    if (ch[2] - cl[2] > ch[axis] - cl[axis]) axis = 2;
+
+    // Median (object) split: sort the range by centroid on the longest axis and
+    // split at the midpoint. This guarantees a balanced tree (~log2 n depth) so
+    // GPU traversal never overflows its fixed stack — a spatial-midpoint split
+    // can degenerate to O(n) depth and drop geometry.
+    const sub = Array.from(idx.subarray(start, end));
+    sub.sort((a, b) => cent[a * 3 + axis] - cent[b * 3 + axis]);
+    idx.set(sub, start);
+    const mid = (start + end) >> 1;
+
+    const left = build(start, mid);
+    const right = build(mid, end);
+    writeAABB(left, -(right + 1)); // internal: store both child indices
+    return ni;
+  }
+
+  build(0, triCount);
+
+  // Reorder triangles into leaf order.
+  const tris = new Float32Array(triCount * stride);
+  for (let i = 0; i < triCount; i++) {
+    tris.set(triData.subarray(idx[i] * stride, idx[i] * stride + stride), i * stride);
+  }
+
+  return { nodes: Float32Array.from(nodes), tris, nodeCount: nodes.length / 8 };
+}
