@@ -1,5 +1,7 @@
 # Aerie
 
+<img width="1920" height="959" alt="aerie-1782789849542" src="https://github.com/user-attachments/assets/f81fb768-8624-4046-8fb4-48c263c52fa3" />
+
 A browser-based custom renderer that acts like **Bryce 2** (MetaCreations, 1996). Import
 modern assets - glTF meshes, skeletons, PBR textures - and render them with the
 dreamy, ray-traced look of the old days.
