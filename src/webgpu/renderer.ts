@@ -3,7 +3,8 @@ import presentWGSL from "../shaders/present.wgsl?raw";
 import type { OrbitCamera } from "../scene/camera";
 import type { Scene } from "../scene/scene";
 import { MAX_PRIMS, MAX_LIGHTS, MAX_CLOUD_LAYERS, LIGHT_FLOATS, LightType } from "../scene/scene";
-import { Vector3 } from "three";
+import { buildTLAS, refitTLAS } from "../mesh/bvh";
+import { Vector3, Matrix4 } from "three";
 
 // Uniform buffer is 10 rows of vec4 = 160 bytes. Keep in sync with the WGSL structs.
 const UNIFORM_FLOATS = 40;
@@ -20,6 +21,13 @@ export class Renderer {
   private bvhBuffer: GPUBuffer;
   private matBuffer: GPUBuffer;
   private instBuffer: GPUBuffer;
+  private tlasBuffer: GPUBuffer;      // TLAS nodes (BVH over instance world AABBs)
+  private tlasOrderBuffer: GPUBuffer; // instance indices in TLAS leaf order
+  // CPU-side copy of the last-built TLAS, kept so a transform-only change (drag)
+  // can refit the tree in place instead of doing a full rebuild + sort.
+  private tlasNodesCPU = new Float32Array(8);
+  private tlasOrderCPU = new Uint32Array(1);
+  private tlasBuiltCount = -1; // instance count the current topology was built for
   private meshTexture: GPUTexture;
   private meshNormalTex: GPUTexture;
   private primTexture: GPUTexture;
@@ -83,6 +91,8 @@ export class Renderer {
     this.bvhBuffer = device.createBuffer({ size: 32, usage: storage });
     this.matBuffer = device.createBuffer({ size: 48, usage: storage });
     this.instBuffer = device.createBuffer({ size: 80, usage: storage });
+    this.tlasBuffer = device.createBuffer({ size: 32, usage: storage }); // 1 placeholder node
+    this.tlasOrderBuffer = device.createBuffer({ size: 4, usage: storage });
     this.meshTexture = this.makeTexture(1, 1);
     this.meshNormalTex = this.makeTexture(1, 1);
     this.primTexture = this.makeTexture(1, 1);
@@ -172,6 +182,8 @@ export class Renderer {
       { binding: 11, resource: this.meshNormalTex.createView({ dimension: "2d-array" }) },
       { binding: 12, resource: { buffer: this.worldBuffer } },
       { binding: 13, resource: this.primTexture.createView({ dimension: "2d-array" }) },
+      { binding: 14, resource: { buffer: this.tlasBuffer } },
+      { binding: 15, resource: { buffer: this.tlasOrderBuffer } },
     ];
   }
 
@@ -442,26 +454,70 @@ export class Renderer {
     }
   }
 
-  /** Upload instance transforms only (cheap — call on add/remove/drag). */
+  /** Upload instance transforms only (cheap — call on add/remove/drag). Also
+   *  rebuilds the TLAS (a BVH over instance world AABBs) so ray/shadow queries
+   *  scale with log(instances) rather than linearly. */
   uploadInstances(scene: Scene): void {
+    const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     const insts = scene.instances;
     const data = new Float32Array(Math.max(20, insts.length * 20));
+    const mins = new Float32Array(Math.max(3, insts.length * 3));
+    const maxs = new Float32Array(Math.max(3, insts.length * 3));
+    const model = new Matrix4();
+    const corner = new Vector3();
     for (let i = 0; i < insts.length; i++) {
       const inst = insts[i];
       const o = i * 20;
       inst.writeInvModel(data, o);
       data[o + 16] = this.nodeBase[inst.blasIndex] ?? 0;
       data[o + 17] = this.triBase[inst.blasIndex] ?? 0;
+
+      // World AABB: the BLAS local-root AABB (nodes[0..6]) transformed by the
+      // model matrix. Transforming the 8 corners bounds any rotation/scale.
+      const n = scene.blases[inst.blasIndex].nodes;
+      const lx = n[0], ly = n[1], lz = n[2], hx = n[4], hy = n[5], hz = n[6];
+      inst.modelMatrix(model);
+      let miX = Infinity, miY = Infinity, miZ = Infinity;
+      let maX = -Infinity, maY = -Infinity, maZ = -Infinity;
+      for (let c = 0; c < 8; c++) {
+        corner.set(c & 1 ? hx : lx, c & 2 ? hy : ly, c & 4 ? hz : lz).applyMatrix4(model);
+        miX = Math.min(miX, corner.x); miY = Math.min(miY, corner.y); miZ = Math.min(miZ, corner.z);
+        maX = Math.max(maX, corner.x); maY = Math.max(maY, corner.y); maZ = Math.max(maZ, corner.z);
+      }
+      mins[i * 3] = miX; mins[i * 3 + 1] = miY; mins[i * 3 + 2] = miZ;
+      maxs[i * 3] = maX; maxs[i * 3 + 1] = maY; maxs[i * 3 + 2] = maZ;
     }
     if (data.byteLength > this.instBuffer.size) {
       this.instBuffer.destroy();
-      this.instBuffer = this.device.createBuffer({
-        size: data.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
+      this.instBuffer = this.device.createBuffer({ size: data.byteLength, usage: storage });
     }
     this.device.queue.writeBuffer(this.instBuffer, 0, data);
     this.instCount = insts.length;
+
+    // Refresh the TLAS. When the instance set is structurally unchanged (a pure
+    // transform edit, e.g. dragging), refit the existing tree in place — cheap,
+    // no sort. Only rebuild the topology when the instance count changes
+    // (add/remove). Buffers stay non-empty; the shader guards traversal on
+    // instCount so the placeholder tree is never walked.
+    if (insts.length !== this.tlasBuiltCount) {
+      const tlas = buildTLAS(mins, maxs, insts.length);
+      this.tlasNodesCPU = tlas.nodes;
+      this.tlasOrderCPU = tlas.order;
+      this.tlasBuiltCount = insts.length;
+      if (tlas.order.byteLength > this.tlasOrderBuffer.size) {
+        this.tlasOrderBuffer.destroy();
+        this.tlasOrderBuffer = this.device.createBuffer({ size: tlas.order.byteLength, usage: storage });
+      }
+      this.device.queue.writeBuffer(this.tlasOrderBuffer, 0, tlas.order); // order only changes on rebuild
+    } else {
+      refitTLAS(this.tlasNodesCPU, this.tlasOrderCPU, this.tlasNodesCPU.length / 8, mins, maxs);
+    }
+    if (this.tlasNodesCPU.byteLength > this.tlasBuffer.size) {
+      this.tlasBuffer.destroy();
+      this.tlasBuffer = this.device.createBuffer({ size: this.tlasNodesCPU.byteLength, usage: storage });
+    }
+    this.device.queue.writeBuffer(this.tlasBuffer, 0, this.tlasNodesCPU);
+
     this.rebuildComputeBind();
     this.resetAccumulation();
   }

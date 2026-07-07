@@ -1,6 +1,6 @@
 {
-  "name": "csbryce",
-  "version": "0.0.1",
+  "name": "aerie",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "A browser-based spiritual successor to Bryce 2 — modern asset import, retro ray-traced renders.",

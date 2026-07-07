@@ -43,7 +43,20 @@ async function main() {
   });
   if (!adapter) fail("No suitable GPU adapter found.");
 
-  const device = await adapter.requestDevice();
+  // The compute tracer binds 10 storage buffers (8 scene pools + TLAS nodes +
+  // TLAS order); the spec only guarantees 8, so raise the limit to what the
+  // adapter actually supports.
+  const NEEDED_STORAGE_BUFFERS = 10;
+  const maxStorage = adapter.limits.maxStorageBuffersPerShaderStage;
+  if (maxStorage < NEEDED_STORAGE_BUFFERS) {
+    fail(
+      `This GPU allows only ${maxStorage} storage buffers per shader stage; ` +
+        `the renderer needs ${NEEDED_STORAGE_BUFFERS}.`,
+    );
+  }
+  const device = await adapter.requestDevice({
+    requiredLimits: { maxStorageBuffersPerShaderStage: NEEDED_STORAGE_BUFFERS },
+  });
   device.lost.then((info) => fail(`GPU device lost: ${info.message}`));
 
   const context = canvas.getContext("webgpu") as GPUCanvasContext;

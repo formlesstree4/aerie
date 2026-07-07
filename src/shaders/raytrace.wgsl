@@ -92,6 +92,11 @@ fn lightRadius(lt: Light) -> f32 {
 @group(0) @binding(10) var<storage, read> instances : array<Inst>;
 @group(0) @binding(11) var meshNormalTex : texture_2d_array<f32>;
 @group(0) @binding(13) var primTex : texture_2d_array<f32>;
+// Top-level acceleration structure: a BVH over instance world AABBs. Same node
+// layout as a BLAS, but a leaf's `lo.w` (first) indexes `tlasOrder` (instance
+// indices) rather than the triangle pool.
+@group(0) @binding(14) var<storage, read> tlasNodes : array<Node>;
+@group(0) @binding(15) var<storage, read> tlasOrder : array<u32>;
 
 struct CloudLayer {
   a : vec4f,  // type, coverage, density, scale
@@ -351,11 +356,38 @@ fn terrainNormal(xz: vec2f) -> vec3f {
   return normalize(vec3f(hL - hR, 2.0 * e, hD - hU));
 }
 
+// The terrain height field is normalized to [0,1] before scaling, so its surface
+// lives entirely within this world-Y slab. Rays are clipped to it so the march
+// skips the empty sky above and stops once it drops below — a large saving for
+// primary rays (start at the slab top) and especially shadow rays toward a high
+// sun (which exit the slab top after a few steps instead of marching to tMax).
+fn terrainYRange() -> vec2f {
+  let a = world.terrain.w;
+  let b = world.terrain.w + world.terrain.x;
+  return vec2f(min(a, b), max(a, b));
+}
+
 fn marchTerrain(ro: vec3f, rd: vec3f, tMax: f32) -> f32 {
-  var t = 0.1;
-  var lastH = 0.0;
-  var lastT = t;
+  let yr = terrainYRange();
+  var t0 = 0.1;
+  var t1 = tMax;
+  if (abs(rd.y) > 1e-5) {
+    let ta = (yr.x - ro.y) / rd.y;
+    let tb = (yr.y - ro.y) / rd.y;
+    t0 = max(t0, min(ta, tb));
+    t1 = min(t1, max(ta, tb));
+  } else if (ro.y < yr.x || ro.y > yr.y) {
+    return -1.0; // parallel to the slab and outside it → never crosses terrain
+  }
+  if (t1 <= t0) { return -1.0; }
+
+  var t = t0;
+  var lastT = t0;
+  var lastH = (ro.y + rd.y * t0) - terrainHeight((ro + rd * t0).xz);
+  if (lastH < 0.0) { return t0; } // entered already at/under the surface
   for (var i = 0; i < 220; i = i + 1) {
+    t += max(0.08, 0.35 * lastH) + t * 0.0045;
+    if (t > t1) { break; }
     let p = ro + rd * t;
     let h = p.y - terrainHeight(p.xz);
     if (h < 0.0) {
@@ -364,8 +396,6 @@ fn marchTerrain(ro: vec3f, rd: vec3f, tMax: f32) -> f32 {
     }
     lastH = h;
     lastT = t;
-    t += max(0.08, 0.35 * h) + t * 0.0045;
-    if (t > tMax) { break; }
   }
   return -1.0;
 }
@@ -777,6 +807,22 @@ fn slabHit(ro: vec3f, invD: vec3f, lo: vec3f, hi: vec3f, tMax: f32) -> bool {
   return far >= max(near, 0.0) && near < tMax;
 }
 
+// Like slabHit, but returns the ray's entry distance into the box (clamped to 0
+// if the origin is inside), or NO_HIT if it misses / lies beyond tMax. Used to
+// order child visitation front-to-back so the nearer subtree tightens bestT
+// before the farther one is tested.
+const NO_HIT = 1e30;
+fn slabEnter(ro: vec3f, invD: vec3f, lo: vec3f, hi: vec3f, tMax: f32) -> f32 {
+  let t0 = (lo - ro) * invD;
+  let t1 = (hi - ro) * invD;
+  let tmin = min(t0, t1);
+  let tmax = max(t0, t1);
+  let near = max(max(tmin.x, tmin.y), tmin.z);
+  let far = min(min(tmax.x, tmax.y), tmax.z);
+  if (far >= max(near, 0.0) && near < tMax) { return max(near, 0.0); }
+  return NO_HIT;
+}
+
 // Traverse one BLAS in its local space. `ro`/`rd` are already in local space
 // (rd is NOT normalized, so t stays comparable to the world ray). Node child
 // links and leaf triangle indices are BLAS-relative; nodeBase/triBase rebase
@@ -806,11 +852,18 @@ fn traceBLAS(ro: vec3f, rd: vec3f, tMax: f32, nodeBase: u32, triBase: u32) -> ve
         }
       }
     } else {
-      // Internal node: count < 0 encodes -(rightChild + 1).
-      let l = nodeBase + u32(node.lo.w);
-      let r = nodeBase + u32(-count - 1);
-      if (sp < 63) { stack[sp] = l; sp = sp + 1; }
-      if (sp < 63) { stack[sp] = r; sp = sp + 1; }
+      // Internal node: count < 0 encodes -(rightChild + 1). Visit the nearer
+      // child first (pushed last → popped first) so bestT tightens early and the
+      // farther subtree is more likely to be culled at its next slabHit.
+      let li = nodeBase + u32(node.lo.w);
+      let ri = nodeBase + u32(-count - 1);
+      let lEnter = slabEnter(ro, invD, nodes[li].lo.xyz, nodes[li].hi.xyz, bestT);
+      let rEnter = slabEnter(ro, invD, nodes[ri].lo.xyz, nodes[ri].hi.xyz, bestT);
+      // Push far first, near second; skip children that already miss.
+      var nearI = li; var nearE = lEnter; var farI = ri; var farE = rEnter;
+      if (rEnter < lEnter) { nearI = ri; nearE = rEnter; farI = li; farE = lEnter; }
+      if (farE < NO_HIT && sp < 63) { stack[sp] = farI; sp = sp + 1; }
+      if (nearE < NO_HIT && sp < 63) { stack[sp] = nearI; sp = sp + 1; }
     }
   }
   return vec4f(select(-1.0, bestT, bestTri >= 0.0), bestTri, bu, bv);
@@ -853,19 +906,45 @@ struct MeshHit {
   v    : f32,
 };
 
-// Top level: test every instance, tracing its BLAS in local space.
+// Top level: traverse the TLAS, descending into each candidate instance's BLAS
+// in local space. Turns the old O(instances) linear scan into O(log instances).
 fn traceInstances(ro: vec3f, rd: vec3f, tMax: f32) -> MeshHit {
   var best: MeshHit;
   best.hit = false;
   best.t = tMax;
-  let n = i32(u.instCount);
-  for (var i = 0; i < n; i = i + 1) {
-    let inst = instances[i];
-    let rol = (inst.invModel * vec4f(ro, 1.0)).xyz;
-    let rdl = (inst.invModel * vec4f(rd, 0.0)).xyz; // unnormalized → t preserved
-    let r = traceBLAS(rol, rdl, best.t, u32(inst.info.x), u32(inst.info.y));
-    if (r.x > 0.0 && r.x < best.t) {
-      best.hit = true; best.t = r.x; best.inst = i; best.tri = i32(r.y); best.u = r.z; best.v = r.w;
+  let invD = 1.0 / rd;
+  var stack: array<u32, 32>;
+  var sp = 0;
+  stack[0] = 0u; sp = 1;
+
+  while (sp > 0) {
+    sp = sp - 1;
+    let node = tlasNodes[stack[sp]];
+    if (!slabHit(ro, invD, node.lo.xyz, node.hi.xyz, best.t)) { continue; }
+    let count = i32(node.hi.w);
+    if (count > 0) {
+      let first = u32(node.lo.w);
+      for (var k = 0u; k < u32(count); k = k + 1u) {
+        let ii = tlasOrder[first + k];
+        let inst = instances[ii];
+        let rol = (inst.invModel * vec4f(ro, 1.0)).xyz;
+        let rdl = (inst.invModel * vec4f(rd, 0.0)).xyz; // unnormalized → t preserved
+        let r = traceBLAS(rol, rdl, best.t, u32(inst.info.x), u32(inst.info.y));
+        if (r.x > 0.0 && r.x < best.t) {
+          best.hit = true; best.t = r.x; best.inst = i32(ii); best.tri = i32(r.y); best.u = r.z; best.v = r.w;
+        }
+      }
+    } else {
+      // Internal node: count < 0 encodes -(rightChild + 1). Visit the nearer
+      // child first so best.t tightens before the farther subtree is tested.
+      let li = u32(node.lo.w);
+      let ri = u32(-count - 1);
+      let lEnter = slabEnter(ro, invD, tlasNodes[li].lo.xyz, tlasNodes[li].hi.xyz, best.t);
+      let rEnter = slabEnter(ro, invD, tlasNodes[ri].lo.xyz, tlasNodes[ri].hi.xyz, best.t);
+      var nearI = li; var nearE = lEnter; var farI = ri; var farE = rEnter;
+      if (rEnter < lEnter) { nearI = ri; nearE = rEnter; farI = li; farE = lEnter; }
+      if (farE < NO_HIT && sp < 31) { stack[sp] = farI; sp = sp + 1; }
+      if (nearE < NO_HIT && sp < 31) { stack[sp] = nearI; sp = sp + 1; }
     }
   }
   return best;
@@ -977,17 +1056,42 @@ fn intersect(ro: vec3f, rd: vec3f) -> Hit {
   return h;
 }
 
+// Any-hit TLAS traversal for shadow rays: stops at the first blocking triangle.
+fn tlasOccluded(o: vec3f, ldir: vec3f, maxDist: f32) -> bool {
+  let invD = 1.0 / ldir;
+  var stack: array<u32, 32>;
+  var sp = 0;
+  stack[0] = 0u; sp = 1;
+
+  while (sp > 0) {
+    sp = sp - 1;
+    let node = tlasNodes[stack[sp]];
+    if (!slabHit(o, invD, node.lo.xyz, node.hi.xyz, maxDist)) { continue; }
+    let count = i32(node.hi.w);
+    if (count > 0) {
+      let first = u32(node.lo.w);
+      for (var k = 0u; k < u32(count); k = k + 1u) {
+        let ii = tlasOrder[first + k];
+        let inst = instances[ii];
+        let rol = (inst.invModel * vec4f(o, 1.0)).xyz;
+        let rdl = (inst.invModel * vec4f(ldir, 0.0)).xyz;
+        if (blasOccluded(rol, rdl, maxDist, u32(inst.info.x), u32(inst.info.y))) { return true; }
+      }
+    } else {
+      let l = u32(node.lo.w);
+      let r = u32(-count - 1);
+      if (sp < 31) { stack[sp] = l; sp = sp + 1; }
+      if (sp < 31) { stack[sp] = r; sp = sp + 1; }
+    }
+  }
+  return false;
+}
+
 fn occluded(p: vec3f, ldir: vec3f, maxDist: f32) -> bool {
   let o = p + ldir * 0.06;
   let mp = marchPrims(o, ldir, min(maxDist, 1000.0));
   if (mp.x > 0.0 && mp.x < maxDist) { return true; }
-  let n = i32(u.instCount);
-  for (var i = 0; i < n; i = i + 1) {
-    let inst = instances[i];
-    let rol = (inst.invModel * vec4f(o, 1.0)).xyz;
-    let rdl = (inst.invModel * vec4f(ldir, 0.0)).xyz;
-    if (blasOccluded(rol, rdl, maxDist, u32(inst.info.x), u32(inst.info.y))) { return true; }
-  }
+  if (u.instCount > 0.5 && tlasOccluded(o, ldir, maxDist)) { return true; }
   if (world.flags.x > 0.5) {
     let tt = marchTerrain(o, ldir, min(maxDist, 800.0));
     if (tt > 0.0 && tt < maxDist) { return true; }
@@ -1043,6 +1147,13 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
   var primaryDist = -1.0;
 
   for (var bounce = 0; bounce < MAX_BOUNCE; bounce = bounce + 1) {
+    // Early-out low-contribution paths: once the accumulated reflection/transmission
+    // throughput is negligible, the remaining bounces add < 1% and we can skip
+    // their (full-scene) intersect. Diffuse hits already break; this trims deep,
+    // dim specular chains (e.g. grazing water → metal). throughput is 1 at bounce
+    // 0, so the primary ray always runs and primaryDist is always captured.
+    if (max(throughput.r, max(throughput.g, throughput.b)) < 0.01) { break; }
+
     let h = intersect(ro, rd);
     if (bounce == 0) { primaryDist = select(1e9, h.t, h.kind != 0); }
 
