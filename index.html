@@ -183,6 +183,47 @@
       }
       .modal-btns .btn.primary:hover { background: rgba(110, 180, 130, 0.47); }
 
+      /* ---- gallery (starter-scene picker) ---- */
+      .modal.gallery { max-width: 560px; }
+      .gallery-grid {
+        display: grid; grid-template-columns: repeat(2, 1fr);
+        gap: 8px; margin: 12px 0 16px;
+      }
+      .gallery-card {
+        display: block; text-align: left; cursor: pointer; font: inherit; color: var(--txt);
+        background: var(--accent); border: 1px solid var(--line);
+        border-radius: var(--radius-sm); padding: 11px 12px;
+      }
+      .gallery-card:hover { background: var(--accent-hi); border-color: var(--line-bright); }
+      .gallery-card-thumb {
+        display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover;
+        border-radius: 5px; margin-bottom: 8px; background: rgba(0, 0, 0, 0.3);
+      }
+      .gallery-card-name { font-weight: 700; color: #eaf2ff; margin-bottom: 4px; }
+      .gallery-card-desc { font-size: 11px; opacity: 0.75; line-height: 1.45; }
+      .gallery-section {
+        margin: 14px 0 8px; font-weight: 700; font-size: 11px; letter-spacing: 0.06em;
+        text-transform: uppercase; color: var(--txt-dim);
+      }
+      .gallery-card { position: relative; }
+      .gallery-card-actions {
+        display: flex; gap: 5px; margin-top: 8px; opacity: 0; transition: opacity 0.12s;
+      }
+      .gallery-card:hover .gallery-card-actions, .gallery-card:focus-within .gallery-card-actions { opacity: 1; }
+      .gallery-card-act {
+        cursor: pointer; font: inherit; font-size: 10px; color: var(--txt);
+        background: rgba(10, 14, 22, 0.6); border: 1px solid var(--line);
+        border-radius: var(--radius-sm); padding: 3px 8px;
+      }
+      .gallery-card-act:hover { background: var(--accent-hi); border-color: var(--line-bright); }
+      .gallery-card-act.danger:hover { background: rgba(200, 90, 90, 0.35); border-color: rgba(255, 150, 150, 0.5); color: #fff; }
+      .modal-input {
+        display: block; width: 100%; box-sizing: border-box; margin: 0 0 10px;
+        font: var(--mono); color: var(--txt); background: rgba(10, 14, 22, 0.6);
+        border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 10px;
+      }
+      .modal-input:focus { outline: none; border-color: var(--line-bright); }
+
       /* ---- top menu bar ---- */
       #menubar {
         position: fixed; top: 0; left: 0; right: 0; z-index: 20;

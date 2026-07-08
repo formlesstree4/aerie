@@ -681,6 +681,15 @@ fn sky(dir: vec3f) -> vec3f {
     let disk = pow(sd, world.zenith.w) * (2.0 + u.sunBright * 6.0);
     let glow = pow(sd, 6.0) * (0.12 * u.sunBright + 0.08);
     col += u.sunColor * (disk + glow);
+
+    // Golden-hour halo: a broad, warm scattering glow around the sun that swells
+    // as the sun nears the horizon and pools along the horizon band — the aerial
+    // glow that makes low-sun scenes read as golden hour. Free (sky-only) and it
+    // also warms distant geometry via the haze, which mixes in sky().
+    let lowSun = 1.0 - smoothstep(0.02, 0.32, u.sunDir.y);
+    let horizonBand = 1.0 - smoothstep(0.0, 0.40, max(dir.y, 0.0));
+    let halo = pow(sd, 2.5) * (0.35 + 0.65 * horizonBand);
+    col += u.sunColor * (halo * lowSun * 0.7 * skyLightAmt());
   }
   return col;
 }
@@ -1103,9 +1112,35 @@ fn fresnelSchlick(cosTheta: f32, f0: f32) -> f32 {
   return f0 + (1.0 - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+// Cosine-weighted hemisphere direction about n (for ambient-occlusion sampling).
+fn cosineHemisphere(n: vec3f) -> vec3f {
+  let r1 = rand();
+  let r2 = rand();
+  let r = sqrt(r1);
+  let phi = 2.0 * PI * r2;
+  let x = r * cos(phi);
+  let y = r * sin(phi);
+  let z = sqrt(max(0.0, 1.0 - r1));
+  let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n.y) > 0.95);
+  let tx = normalize(cross(up, n));
+  let ty = cross(n, tx);
+  return normalize(tx * x + ty * y + n * z);
+}
+
+// Ambient occlusion: distance within which nearby geometry darkens the ambient,
+// and the ambient floor a fully-occluded point keeps. One sky-visibility ray per
+// sample averages into soft AO as frames accumulate.
+const AO_DIST  = 14.0;
+const AO_FLOOR = 0.35;
+
 // Direct + ambient lighting for a diffuse point.
 fn shade(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
-  var col = skyGradient(n) * skyLightAmt() * 0.30 * albedo; // skylight ambient (sun-driven)
+  // Skylight ambient (sun-driven), attenuated by local sky visibility so contact
+  // points and crevices darken — this grounds objects instead of leaving them
+  // looking pasted onto the scene.
+  var ambient = skyGradient(n) * skyLightAmt() * 0.30 * albedo;
+  if (occluded(pos, cosineHemisphere(n), AO_DIST)) { ambient *= AO_FLOOR; }
+  var col = ambient;
   let n_lights = i32(u.lightCount);
   for (var i = 0; i < n_lights; i = i + 1) {
     let lt = lights[i];

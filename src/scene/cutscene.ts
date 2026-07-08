@@ -23,12 +23,17 @@ export interface CamKey {
   pitch: number;
   aperture: number;
   focusDistance: number;
+  // Atmosphere: animatable so a shot can move through the day. timeOfDay drives
+  // sun + sky + exposure via applyTimeOfDay; exposure/haze layer on top.
+  timeOfDay: number;
+  exposure: number;
+  haze: number;
   duration: number;
   ease: Ease;
   objects?: ObjXform[];
 }
 
-/** The interpolated state at a point in time (camera + DoF + objects). */
+/** The interpolated state at a point in time (camera + DoF + atmosphere + objects). */
 export interface CamState {
   target: [number, number, number];
   distance: number;
@@ -36,6 +41,9 @@ export interface CamState {
   pitch: number;
   aperture: number;
   focusDistance: number;
+  timeOfDay: number;
+  exposure: number;
+  haze: number;
   objects?: ObjXform[];
 }
 
@@ -97,6 +105,7 @@ const stateOf = (k: CamKey): CamState => ({
   target: [k.target[0], k.target[1], k.target[2]],
   distance: k.distance, yaw: k.yaw, pitch: k.pitch,
   aperture: k.aperture, focusDistance: k.focusDistance,
+  timeOfDay: k.timeOfDay, exposure: k.exposure, haze: k.haze,
   objects: k.objects,
 });
 
@@ -134,6 +143,9 @@ export function evalCutscene(keys: CamKey[], t: number): CamState | null {
         pitch: lerp(a.pitch, b.pitch, u),
         aperture: lerp(a.aperture, b.aperture, u),
         focusDistance: lerp(a.focusDistance, b.focusDistance, u),
+        timeOfDay: lerp(a.timeOfDay, b.timeOfDay, u),
+        exposure: lerp(a.exposure, b.exposure, u),
+        haze: lerp(a.haze, b.haze, u),
         objects: lerpObjects(a.objects, b.objects, u),
       };
     }

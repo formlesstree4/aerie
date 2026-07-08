@@ -1,7 +1,7 @@
 import raytraceWGSL from "../shaders/raytrace.wgsl?raw";
 import presentWGSL from "../shaders/present.wgsl?raw";
 import { MAX_PRIMS, MAX_LIGHTS, MAX_CLOUD_LAYERS, LIGHT_FLOATS, LightType } from "../scene/scene";
-import { buildTLAS } from "../mesh/bvh";
+import { buildTLAS, refitTLAS } from "../mesh/bvh";
 import { Vector3, Matrix4 } from "three";
 // Uniform buffer is 10 rows of vec4 = 160 bytes. Keep in sync with the WGSL structs.
 const UNIFORM_FLOATS = 40;
@@ -21,6 +21,11 @@ export class Renderer {
     instBuffer;
     tlasBuffer; // TLAS nodes (BVH over instance world AABBs)
     tlasOrderBuffer; // instance indices in TLAS leaf order
+    // CPU-side copy of the last-built TLAS, kept so a transform-only change (drag)
+    // can refit the tree in place instead of doing a full rebuild + sort.
+    tlasNodesCPU = new Float32Array(8);
+    tlasOrderCPU = new Uint32Array(1);
+    tlasBuiltCount = -1; // instance count the current topology was built for
     meshTexture;
     meshNormalTex;
     primTexture;
@@ -503,19 +508,30 @@ export class Renderer {
         }
         this.device.queue.writeBuffer(this.instBuffer, 0, data);
         this.instCount = insts.length;
-        // Build + upload the TLAS. Buffers are always non-empty (the shader guards
-        // traversal on instCount, so the placeholder tree is never walked).
-        const tlas = buildTLAS(mins, maxs, insts.length);
-        if (tlas.nodes.byteLength > this.tlasBuffer.size) {
+        // Refresh the TLAS. When the instance set is structurally unchanged (a pure
+        // transform edit, e.g. dragging), refit the existing tree in place — cheap,
+        // no sort. Only rebuild the topology when the instance count changes
+        // (add/remove). Buffers stay non-empty; the shader guards traversal on
+        // instCount so the placeholder tree is never walked.
+        if (insts.length !== this.tlasBuiltCount) {
+            const tlas = buildTLAS(mins, maxs, insts.length);
+            this.tlasNodesCPU = tlas.nodes;
+            this.tlasOrderCPU = tlas.order;
+            this.tlasBuiltCount = insts.length;
+            if (tlas.order.byteLength > this.tlasOrderBuffer.size) {
+                this.tlasOrderBuffer.destroy();
+                this.tlasOrderBuffer = this.device.createBuffer({ size: tlas.order.byteLength, usage: storage });
+            }
+            this.device.queue.writeBuffer(this.tlasOrderBuffer, 0, tlas.order); // order only changes on rebuild
+        }
+        else {
+            refitTLAS(this.tlasNodesCPU, this.tlasOrderCPU, this.tlasNodesCPU.length / 8, mins, maxs);
+        }
+        if (this.tlasNodesCPU.byteLength > this.tlasBuffer.size) {
             this.tlasBuffer.destroy();
-            this.tlasBuffer = this.device.createBuffer({ size: tlas.nodes.byteLength, usage: storage });
+            this.tlasBuffer = this.device.createBuffer({ size: this.tlasNodesCPU.byteLength, usage: storage });
         }
-        this.device.queue.writeBuffer(this.tlasBuffer, 0, tlas.nodes);
-        if (tlas.order.byteLength > this.tlasOrderBuffer.size) {
-            this.tlasOrderBuffer.destroy();
-            this.tlasOrderBuffer = this.device.createBuffer({ size: tlas.order.byteLength, usage: storage });
-        }
-        this.device.queue.writeBuffer(this.tlasOrderBuffer, 0, tlas.order);
+        this.device.queue.writeBuffer(this.tlasBuffer, 0, this.tlasNodesCPU);
         this.rebuildComputeBind();
         this.resetAccumulation();
     }

@@ -80,7 +80,17 @@ export function buildUI(scene, getSpawn, hooks) {
         if (f)
             hooks.onImport(f);
     });
-    document.body.append(sceneFileInput, modelFileInput);
+    const galleryFileInput = el("input");
+    galleryFileInput.type = "file";
+    galleryFileInput.accept = ".aeriescene,.json";
+    galleryFileInput.style.display = "none";
+    galleryFileInput.addEventListener("change", () => {
+        const f = galleryFileInput.files?.[0];
+        if (f)
+            hooks.onImportToGallery(f);
+        galleryFileInput.value = ""; // allow re-importing the same file
+    });
+    document.body.append(sceneFileInput, modelFileInput, galleryFileInput);
     function slider(label, value, min, max, step, onInput) {
         const row = el("div", "row");
         const lab = el("label", "lab", label);
@@ -586,6 +596,12 @@ export function buildUI(scene, getSpawn, hooks) {
                 easeRow.append(b);
             });
             ed.append(easeRow);
+            // Atmosphere: animate time of day (sun + sky), exposure and haze per key.
+            const atmo = cs.keyAtmo(sel);
+            ed.append(el("div", "hint", "Atmosphere — animate the light across the shot"));
+            ed.append(plainSlider("time of day", atmo.timeOfDay, 0, 24, 0.1, (v) => cs.setKeyAtmo(sel, "timeOfDay", v)));
+            ed.append(plainSlider("exposure", atmo.exposure, 0.2, 3, 0.05, (v) => cs.setKeyAtmo(sel, "exposure", v)));
+            ed.append(plainSlider("haze", atmo.haze, 0, 0.02, 0.0005, (v) => cs.setKeyAtmo(sel, "haze", v)));
             const ops = el("div", "btns");
             ops.append(button("Jump to", () => cs.select(sel)), button("Re-capture", () => cs.recapture(sel)), button("Delete", () => cs.remove(sel)));
             ed.append(ops);
@@ -1272,6 +1288,9 @@ export function buildUI(scene, getSpawn, hooks) {
             pop.append(menuItem("Save PNG…", () => hooks.onRenderImage()));
         });
         const sceneMenu = menu("scene", "Scene", (pop) => {
+            pop.append(menuItem("Gallery…", () => hooks.onOpenGallery()));
+            pop.append(menuItem("Save to gallery…", () => hooks.onSaveToGallery()));
+            pop.append(menuItem("Import to gallery…", () => galleryFileInput.click()));
             pop.append(menuItem("New scene…", () => hooks.onNewScene()));
             pop.append(el("div", "menu-sep"));
             pop.append(menuItem("Save scene…", () => hooks.onSaveScene()));

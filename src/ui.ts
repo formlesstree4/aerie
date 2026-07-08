@@ -29,6 +29,8 @@ export interface CutsceneController {
   duration(): number;
   playing(): boolean;
   keyInfo(i: number): { duration: number; ease: Ease; time: number };
+  keyAtmo(i: number): { timeOfDay: number; exposure: number; haze: number };
+  setKeyAtmo(i: number, field: "timeOfDay" | "exposure" | "haze", v: number): void;
   add(): void;
   remove(i: number): void;
   recapture(i: number): void;
@@ -78,6 +80,9 @@ export interface UIHooks {
   onRerollLandform: (inst: MeshInstance) => void;
   onAddPlanet: () => void;
   onNewScene: () => void;
+  onOpenGallery: () => void;
+  onSaveToGallery: () => void;
+  onImportToGallery: (file: File) => void;
   onSaveScene: () => void;
   onLoadScene: (file: File) => void;
   isEditing: () => boolean;
@@ -221,7 +226,16 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
     const f = modelFileInput.files?.[0];
     if (f) hooks.onImport(f);
   });
-  document.body.append(sceneFileInput, modelFileInput);
+  const galleryFileInput = el("input") as HTMLInputElement;
+  galleryFileInput.type = "file";
+  galleryFileInput.accept = ".aeriescene,.json";
+  galleryFileInput.style.display = "none";
+  galleryFileInput.addEventListener("change", () => {
+    const f = galleryFileInput.files?.[0];
+    if (f) hooks.onImportToGallery(f);
+    galleryFileInput.value = ""; // allow re-importing the same file
+  });
+  document.body.append(sceneFileInput, modelFileInput, galleryFileInput);
 
   function slider(
     label: string,
@@ -746,6 +760,14 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
         easeRow.append(b);
       });
       ed.append(easeRow);
+
+      // Atmosphere: animate time of day (sun + sky), exposure and haze per key.
+      const atmo = cs.keyAtmo(sel);
+      ed.append(el("div", "hint", "Atmosphere — animate the light across the shot"));
+      ed.append(plainSlider("time of day", atmo.timeOfDay, 0, 24, 0.1, (v) => cs.setKeyAtmo(sel, "timeOfDay", v)));
+      ed.append(plainSlider("exposure", atmo.exposure, 0.2, 3, 0.05, (v) => cs.setKeyAtmo(sel, "exposure", v)));
+      ed.append(plainSlider("haze", atmo.haze, 0, 0.02, 0.0005, (v) => cs.setKeyAtmo(sel, "haze", v)));
+
       const ops = el("div", "btns");
       ops.append(
         button("Jump to", () => cs.select(sel)),
@@ -1496,6 +1518,9 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
     });
 
     const sceneMenu = menu("scene", "Scene", (pop) => {
+      pop.append(menuItem("Gallery…", () => hooks.onOpenGallery()));
+      pop.append(menuItem("Save to gallery…", () => hooks.onSaveToGallery()));
+      pop.append(menuItem("Import to gallery…", () => galleryFileInput.click()));
       pop.append(menuItem("New scene…", () => hooks.onNewScene()));
       pop.append(el("div", "menu-sep"));
       pop.append(menuItem("Save scene…", () => hooks.onSaveScene()));

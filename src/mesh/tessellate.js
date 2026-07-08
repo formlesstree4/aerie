@@ -185,6 +185,17 @@ function octahedronMesh(s) {
     }
     return b;
 }
+/** A primitive's tessellated surface as a LOCAL-space BufferGeometry — the caller
+ *  applies the primitive's transform on the mesh, so it can move/rotate without
+ *  re-tessellating (used by the raster preview). */
+export function primitiveLocalGeometry(prim) {
+    const m = meshFor(prim);
+    const g = new BufferGeometry();
+    g.setAttribute("position", new Float32BufferAttribute(m.pos, 3));
+    g.setAttribute("normal", new Float32BufferAttribute(m.nor, 3));
+    g.setIndex(new Uint32BufferAttribute(m.idx, 1));
+    return g;
+}
 /** A primitive's tessellated surface as a world-space BufferGeometry (for CSG). */
 export function primitiveGeometry(prim) {
     const m = meshFor(prim);

@@ -1,6 +1,7 @@
 import { Renderer } from "./webgpu/renderer";
 import { OrbitCamera } from "./scene/camera";
-import { defaultScene, Primitive, MeshInstance, Light, LightType, PrimType, PrimPattern, PRIM_LABELS } from "./scene/scene";
+import { defaultScene, Primitive, MeshInstance, Light, LightType, PrimType, PrimPattern, PRIM_LABELS, type SceneState } from "./scene/scene";
+import { SCENE_PRESETS, type ScenePreset, type CameraHint } from "./scene/presets";
 import { buildUI, type ScatterOptions, type TurntableOptions } from "./ui";
 import { Preview } from "./preview";
 import { importModel, bakePose, worldMesh } from "./mesh/modelImport";
@@ -483,10 +484,10 @@ async function main() {
     });
   }
 
-  // Reset the live scene back to the vanilla default, dropping models, edit/pose
-  // modes, and undo history.
-  function resetScene() {
-    scene.restoreState(defaultScene().captureState());
+  // Swap in a fresh scene state (new / gallery preset), dropping models, edit/pose
+  // modes, cutscene, and undo history, and reselecting a sensible default.
+  function applySceneState(state: SceneState, label: string) {
+    scene.restoreState(state);
     editInstance = null; editMesh = null;
     poseInst = null; poseBones = []; selectedBone = -1;
     selectedVerts.clear();
@@ -499,7 +500,12 @@ async function main() {
     history.reset();
     ui.select(scene.prims[0] ?? scene.lights[0] ?? null);
     ui.refresh();
-    hud.textContent = "New scene";
+    hud.textContent = label;
+  }
+
+  // Reset the live scene back to the vanilla default.
+  function resetScene() {
+    applySceneState(defaultScene().captureState(), "New scene");
   }
 
   // New Scene: offer to save first if there are unsaved changes, then reset.
@@ -512,7 +518,353 @@ async function main() {
     resetScene();
   }
 
-  function saveScene() {
+  // Point a camera at a framing hint (falls back to a generic origin view).
+  function applyCameraHint(c: OrbitCamera, h?: CameraHint): void {
+    const f = h ?? { target: [0, 6, 0] as [number, number, number], distance: 80, yaw: -0.6, pitch: 0.24 };
+    c.target.set(f.target[0], f.target[1], f.target[2]);
+    c.distance = f.distance; c.yaw = f.yaw; c.pitch = f.pitch;
+    c.update();
+  }
+  const cameraHintFromCam = (): CameraHint => ({
+    target: [cam.target.x, cam.target.y, cam.target.z],
+    distance: cam.distance, yaw: cam.yaw, pitch: cam.pitch,
+  });
+
+  const THUMB_W = 256, THUMB_H = 160, THUMB_SAMPLES = 80;
+
+  // Render whatever scene is currently uploaded to the renderer to a PNG data URL
+  // at the given framing. Freezes the live loop so it doesn't fight the GPU.
+  async function renderThumbnail(hint?: CameraHint): Promise<string> {
+    const tcam = new OrbitCamera();
+    applyCameraHint(tcam, hint);
+    const wasOffline = offlineRendering;
+    offlineRendering = true;
+    try {
+      const px = await renderer.renderToPixels(tcam, THUMB_W, THUMB_H, THUMB_SAMPLES);
+      const cnv = document.createElement("canvas");
+      cnv.width = THUMB_W; cnv.height = THUMB_H;
+      cnv.getContext("2d")!.putImageData(new ImageData(px, THUMB_W, THUMB_H), 0, 0);
+      return cnv.toDataURL("image/png");
+    } finally {
+      offlineRendering = wasOffline;
+    }
+  }
+
+  // Cached built-in thumbnails (preset id → PNG data URL), ray-traced once on the
+  // first gallery open by borrowing the renderer to draw each preset small.
+  const thumbCache = new Map<string, string>();
+  let thumbsGenerated = false;
+
+  async function ensureThumbnails(): Promise<void> {
+    if (thumbsGenerated) return;
+    hud.textContent = "Rendering gallery previews…";
+    try {
+      for (const preset of SCENE_PRESETS) {
+        if (thumbCache.has(preset.id)) continue;
+        const s = preset.build();
+        renderer.uploadScene(s);
+        renderer.uploadInstances(s);
+        renderer.uploadWorld(s);
+        renderer.uploadPrimTextures(s);
+        thumbCache.set(preset.id, await renderThumbnail(preset.camera));
+      }
+      thumbsGenerated = true;
+    } finally {
+      // Restore the live scene into the renderer so the viewport is correct on
+      // cancel (the version-gated frame loop won't re-upload an unchanged scene).
+      renderer.uploadScene(scene);
+      renderer.uploadInstances(scene);
+      renderer.uploadWorld(scene);
+      renderer.uploadPrimTextures(scene);
+      hud.textContent = "";
+    }
+  }
+
+  // ---- user-saved gallery scenes (persisted in localStorage) ----
+  interface CustomScene {
+    id: string;
+    name: string;
+    description: string;
+    thumbnail: string;   // PNG data URL
+    camera: CameraHint;  // framing captured at save time
+    scene: string;       // serialized .aerie JSON
+    created: number;
+  }
+  const GALLERY_KEY = "aerie.gallery.v1";
+
+  function loadCustomScenes(): CustomScene[] {
+    try {
+      const raw = localStorage.getItem(GALLERY_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  }
+  function persistCustomScenes(list: CustomScene[]): boolean {
+    try {
+      localStorage.setItem(GALLERY_KEY, JSON.stringify(list));
+      return true;
+    } catch {
+      return false; // quota exceeded (e.g. large embedded models) or disabled
+    }
+  }
+
+  // Save the current scene as a gallery entry: capture framing, render a
+  // thumbnail, serialize, and persist locally.
+  async function saveToGallery() {
+    const meta = await promptSceneMeta();
+    if (!meta) return;
+    hud.textContent = "Saving to gallery…";
+    // Make sure the renderer holds the live scene before we thumbnail it.
+    renderer.uploadScene(scene);
+    renderer.uploadInstances(scene);
+    renderer.uploadWorld(scene);
+    renderer.uploadPrimTextures(scene);
+    const camera = cameraHintFromCam();
+    const thumbnail = await renderThumbnail(camera);
+    const entry: CustomScene = {
+      id: `custom-${Date.now()}`,
+      name: meta.name,
+      description: meta.description,
+      thumbnail,
+      camera,
+      scene: serializeCurrentScene(),
+      created: Date.now(),
+    };
+    const list = loadCustomScenes();
+    list.push(entry);
+    hud.textContent = persistCustomScenes(list)
+      ? `Saved “${entry.name}” to gallery.`
+      : "Couldn't save — local storage is full. Try Export instead (models make scenes large).";
+  }
+
+  // Download a gallery entry as a portable .aeriescene file (self-contained:
+  // thumbnail + framing + scene).
+  function exportCustomScene(entry: CustomScene): void {
+    const blob = new Blob([JSON.stringify(entry)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${entry.name.replace(/[^\w -]+/g, "_") || "scene"}.aeriescene`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // Import a .aeriescene file into the local gallery (fresh id to avoid clashes).
+  async function importToGallery(file: File): Promise<void> {
+    try {
+      const entry = JSON.parse(await file.text()) as CustomScene;
+      if (typeof entry.scene !== "string" || typeof entry.name !== "string") {
+        throw new Error("not a gallery scene file");
+      }
+      entry.id = `custom-${Date.now()}`;
+      const list = loadCustomScenes();
+      list.push(entry);
+      hud.textContent = persistCustomScenes(list)
+        ? `Imported “${entry.name}” to gallery.`
+        : "Import failed — local storage is full.";
+    } catch (e) {
+      hud.textContent = `Import failed: ${e instanceof Error ? e.message : e}`;
+    }
+  }
+
+  // Load a saved gallery scene (full deserialize path) and frame it.
+  async function loadCustomScene(entry: CustomScene): Promise<void> {
+    await loadSceneFromText(entry.scene, `Loaded “${entry.name}”`);
+    applyCameraHint(cam, entry.camera);
+  }
+
+  // A small modal that collects a name + description for a new gallery entry.
+  function promptSceneMeta(): Promise<{ name: string; description: string } | null> {
+    return new Promise((resolve) => {
+      const backdrop = document.createElement("div");
+      backdrop.className = "modal-backdrop";
+      const box = document.createElement("div");
+      box.className = "modal";
+      const title = document.createElement("div");
+      title.className = "modal-title";
+      title.textContent = "Save to gallery";
+      const nameIn = document.createElement("input");
+      nameIn.className = "modal-input";
+      nameIn.placeholder = "Scene name";
+      nameIn.value = "My Scene";
+      const descIn = document.createElement("input");
+      descIn.className = "modal-input";
+      descIn.placeholder = "Short description (optional)";
+      const btns = document.createElement("div");
+      btns.className = "modal-btns";
+      const close = (val: { name: string; description: string } | null) => {
+        document.removeEventListener("keydown", onKey, true);
+        backdrop.remove();
+        resolve(val);
+      };
+      const commit = () => {
+        const name = nameIn.value.trim();
+        if (!name) { nameIn.focus(); return; }
+        close({ name, description: descIn.value.trim() });
+      };
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === "Escape") { e.stopPropagation(); close(null); }
+        if (e.key === "Enter") { e.stopPropagation(); commit(); }
+      };
+      const cancel = document.createElement("button");
+      cancel.className = "btn";
+      cancel.textContent = "Cancel";
+      cancel.addEventListener("click", () => close(null));
+      const save = document.createElement("button");
+      save.className = "btn primary";
+      save.textContent = "Save";
+      save.addEventListener("click", commit);
+      btns.append(cancel, save);
+      box.append(title, nameIn, descIn, btns);
+      backdrop.append(box);
+      backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(null); });
+      document.addEventListener("keydown", onKey, true);
+      document.body.append(backdrop);
+      nameIn.focus();
+      nameIn.select();
+    });
+  }
+
+  type GalleryChoice = { builtin: ScenePreset } | { custom: CustomScene };
+
+  // A modal grid of built-in starter scenes plus the user's saved scenes.
+  // Custom cards carry Export/Delete actions; resolves to the picked scene.
+  function pickPreset(): Promise<GalleryChoice | null> {
+    return new Promise((resolve) => {
+      const backdrop = document.createElement("div");
+      backdrop.className = "modal-backdrop";
+      const box = document.createElement("div");
+      box.className = "modal gallery";
+      const title = document.createElement("div");
+      title.className = "modal-title";
+      title.textContent = "Gallery — start from a scene";
+
+      const close = (val: GalleryChoice | null) => {
+        document.removeEventListener("keydown", onKey, true);
+        backdrop.remove();
+        resolve(val);
+      };
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === "Escape") { e.stopPropagation(); close(null); }
+      };
+
+      const makeCard = (o: {
+        thumb?: string; name: string; desc: string; onClick: () => void;
+        onExport?: () => void; onDelete?: () => void;
+      }): HTMLElement => {
+        // A div (not <button>) so it can legally contain the action buttons.
+        const card = document.createElement("div");
+        card.className = "gallery-card";
+        card.tabIndex = 0;
+        if (o.thumb) {
+          const img = document.createElement("img");
+          img.className = "gallery-card-thumb";
+          img.src = o.thumb; img.alt = o.name;
+          card.append(img);
+        }
+        const name = document.createElement("div");
+        name.className = "gallery-card-name";
+        name.textContent = o.name;
+        const desc = document.createElement("div");
+        desc.className = "gallery-card-desc";
+        desc.textContent = o.desc;
+        card.append(name, desc);
+        if (o.onExport || o.onDelete) {
+          const actions = document.createElement("div");
+          actions.className = "gallery-card-actions";
+          if (o.onExport) {
+            const ex = document.createElement("button");
+            ex.className = "gallery-card-act";
+            ex.textContent = "Export";
+            ex.addEventListener("click", (e) => { e.stopPropagation(); o.onExport!(); });
+            actions.append(ex);
+          }
+          if (o.onDelete) {
+            const del = document.createElement("button");
+            del.className = "gallery-card-act danger";
+            del.textContent = "Delete";
+            del.addEventListener("click", (e) => { e.stopPropagation(); o.onDelete!(); });
+            actions.append(del);
+          }
+          card.append(actions);
+        }
+        card.addEventListener("click", o.onClick);
+        return card;
+      };
+
+      const body = document.createElement("div");
+      const renderCards = () => {
+        body.textContent = "";
+        const grid = document.createElement("div");
+        grid.className = "gallery-grid";
+        for (const p of SCENE_PRESETS) {
+          grid.append(makeCard({
+            thumb: thumbCache.get(p.id), name: p.name, desc: p.description,
+            onClick: () => close({ builtin: p }),
+          }));
+        }
+        body.append(grid);
+
+        const custom = loadCustomScenes();
+        if (custom.length) {
+          const sub = document.createElement("div");
+          sub.className = "gallery-section";
+          sub.textContent = "Your scenes";
+          body.append(sub);
+          const cgrid = document.createElement("div");
+          cgrid.className = "gallery-grid";
+          for (const entry of custom) {
+            cgrid.append(makeCard({
+              thumb: entry.thumbnail, name: entry.name, desc: entry.description,
+              onClick: () => close({ custom: entry }),
+              onExport: () => exportCustomScene(entry),
+              onDelete: () => { persistCustomScenes(loadCustomScenes().filter((c) => c.id !== entry.id)); renderCards(); },
+            }));
+          }
+          body.append(cgrid);
+        }
+      };
+      renderCards();
+
+      const btns = document.createElement("div");
+      btns.className = "modal-btns";
+      const cancel = document.createElement("button");
+      cancel.className = "btn";
+      cancel.textContent = "Cancel";
+      cancel.addEventListener("click", () => close(null));
+      btns.append(cancel);
+
+      box.append(title, body, btns);
+      backdrop.append(box);
+      backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(null); });
+      document.addEventListener("keydown", onKey, true);
+      document.body.append(backdrop);
+    });
+  }
+
+  // Gallery: offer to save unsaved work, pick a scene, then load it (built-in
+  // presets rebuild synchronously; custom scenes go through the full loader).
+  async function openGallery() {
+    if (scene.version !== savedVersion) {
+      const choice = await askSaveChanges();
+      if (choice === "cancel") return;
+      if (choice === "save") saveScene();
+    }
+    await ensureThumbnails(); // one-time: ray-trace a preview of each built-in
+    const pick = await pickPreset();
+    if (!pick) return;
+    if ("builtin" in pick) {
+      applySceneState(pick.builtin.build().captureState(), `Loaded “${pick.builtin.name}”`);
+      applyCameraHint(cam, pick.builtin.camera);
+    } else {
+      await loadCustomScene(pick.custom);
+    }
+  }
+
+  // Serialize the live scene to an .aerie JSON string (models, poses, cutscene).
+  function serializeCurrentScene(): string {
     // Serialize the canonical (home) object/DoF state, not a mid-cutscene pose.
     if (cutsceneMode) { restoreHome(); cutsceneTime = 0; cutscenePlaying = false; ui.refresh(); }
     // Object ids regenerate on load, so persist cutscene object refs as positional
@@ -527,7 +879,7 @@ async function main() {
         ?.map((o) => ({ ...o, id: slotOf.get(o.id) ?? -1 }))
         .filter((o) => o.id >= 0),
     }));
-    const json = serializeScene(scene, {
+    return serializeScene(scene, {
       fileFor: (bi) => scene.blasFile[bi],
       poseFor: (id) => {
         const bones = preview.getBones(id);
@@ -542,6 +894,10 @@ async function main() {
       },
       cutscene: cutsceneOut,
     });
+  }
+
+  function saveScene() {
+    const json = serializeCurrentScene();
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -553,8 +909,12 @@ async function main() {
   }
 
   async function loadScene(file: File) {
+    await loadSceneFromText(await file.text(), `Loaded ${file.name}`);
+  }
+
+  async function loadSceneFromText(text: string, label: string) {
     try {
-      const data = deserializeScene(scene, await file.text());
+      const data = deserializeScene(scene, text);
       // Exit any per-object modes that reference now-gone objects.
       editInstance = null; editMesh = null;
       poseInst = null; poseBones = []; selectedBone = -1;
@@ -596,6 +956,11 @@ async function main() {
       for (const m of scene.instances) slotToId.push(m.id);
       cutsceneKeys = (Array.isArray(data.cutscene) ? (data.cutscene as CamKey[]) : []).map((k) => ({
         ...k,
+        // Backfill atmosphere for scenes saved before it was animatable, so
+        // older cutscenes keep their (fixed) look rather than reading NaN.
+        timeOfDay: k.timeOfDay ?? scene.world.timeOfDay,
+        exposure: k.exposure ?? scene.world.exposure,
+        haze: k.haze ?? scene.world.hazeDensity,
         objects: (k.objects as ObjXform[] | undefined)
           ?.map((o) => ({ ...o, id: slotToId[o.id] ?? -1 }))
           .filter((o) => o.id >= 0),
@@ -608,7 +973,7 @@ async function main() {
       history.commit();
       savedVersion = scene.version; // freshly loaded scene matches its file
       ui.refresh();
-      hud.textContent = `Loaded ${file.name}`;
+      hud.textContent = label;
     } catch (e) {
       hud.textContent = `Load failed: ${e instanceof Error ? e.message : e}`;
     }
@@ -759,7 +1124,41 @@ async function main() {
   // Canonical object transforms + DoF captured on cutscene entry; restored on
   // exit/save so the cutscene's per-frame mutation never disturbs the saved scene.
   type HomeXform = { id: number; pos: [number, number, number]; rot: [number, number, number]; scale: number };
-  let cutsceneHome: { xforms: HomeXform[]; aperture: number; focusDistance: number } | null = null;
+  // Full atmosphere snapshot: the cutscene animates timeOfDay (which re-derives
+  // sun + sky), so we save the derived state verbatim and restore it as-is —
+  // preserving a custom sky rather than re-deriving it from a time value.
+  type AtmoSnap = {
+    timeOfDay: number; exposure: number; haze: number;
+    zenith: [number, number, number]; horizon: [number, number, number]; stars: boolean;
+    sunDir: [number, number, number] | null; sunColor: [number, number, number] | null; sunIntensity: number;
+  };
+  let cutsceneHome: { xforms: HomeXform[]; aperture: number; focusDistance: number; atmo: AtmoSnap } | null = null;
+
+  function captureAtmo(): AtmoSnap {
+    const w = scene.world;
+    const sun = scene.lights.find((l) => l.type === LightType.Directional);
+    return {
+      timeOfDay: w.timeOfDay, exposure: w.exposure, haze: w.hazeDensity,
+      zenith: [...w.zenith], horizon: [...w.horizon], stars: w.starsEnabled,
+      sunDir: sun ? [sun.direction.x, sun.direction.y, sun.direction.z] : null,
+      sunColor: sun ? [...sun.color] : null,
+      sunIntensity: sun ? sun.intensity : 0,
+    };
+  }
+
+  function restoreAtmo(a: AtmoSnap): void {
+    const w = scene.world;
+    w.timeOfDay = a.timeOfDay; w.exposure = a.exposure; w.hazeDensity = a.haze;
+    w.zenith = [...a.zenith]; w.horizon = [...a.horizon]; w.starsEnabled = a.stars;
+    const sun = scene.lights.find((l) => l.type === LightType.Directional);
+    if (sun && a.sunDir && a.sunColor) {
+      sun.direction.set(a.sunDir[0], a.sunDir[1], a.sunDir[2]);
+      sun.color = [...a.sunColor];
+      sun.intensity = a.sunIntensity;
+    }
+    scene.touchWorld();
+    scene.touch();
+  }
   const csQuat = new Quaternion();
 
   // Snapshot every animatable object's transform (prims: pos+rot; meshes: +scale).
@@ -781,6 +1180,7 @@ async function main() {
       target: [cam.target.x, cam.target.y, cam.target.z],
       distance: cam.distance, yaw: cam.yaw, pitch: cam.pitch,
       aperture: scene.world.aperture, focusDistance: scene.world.focusDistance,
+      timeOfDay: scene.world.timeOfDay, exposure: scene.world.exposure, haze: scene.world.hazeDensity,
       duration: cutsceneKeys.length === 0 ? 0 : 2,
       ease: "smooth",
       objects: captureObjects(),
@@ -798,10 +1198,10 @@ async function main() {
     const xforms: HomeXform[] = [];
     for (const p of scene.prims) xforms.push({ id: p.id, pos: [p.position.x, p.position.y, p.position.z], rot: [p.rotation.x, p.rotation.y, p.rotation.z], scale: 1 });
     for (const m of scene.instances) xforms.push({ id: m.id, pos: [m.position.x, m.position.y, m.position.z], rot: [m.rotation.x, m.rotation.y, m.rotation.z], scale: m.scale });
-    cutsceneHome = { xforms, aperture: scene.world.aperture, focusDistance: scene.world.focusDistance };
+    cutsceneHome = { xforms, aperture: scene.world.aperture, focusDistance: scene.world.focusDistance, atmo: captureAtmo() };
   }
 
-  // Put objects + DoF back to their canonical (pre-cutscene) state.
+  // Put objects + DoF + atmosphere back to their canonical (pre-cutscene) state.
   function restoreHome() {
     if (!cutsceneHome) return;
     const byId = objectsById();
@@ -814,11 +1214,12 @@ async function main() {
     }
     scene.world.aperture = cutsceneHome.aperture;
     scene.world.focusDistance = cutsceneHome.focusDistance;
+    restoreAtmo(cutsceneHome.atmo);
     scene.touchInstances();
     scene.touchWorld();
   }
 
-  // Pose the camera + DoF + tracked objects at timeline time `t`.
+  // Pose the camera + DoF + atmosphere + tracked objects at timeline time `t`.
   function applyCutsceneAt(t: number) {
     const s = evalCutscene(cutsceneKeys, t);
     if (!s) return;
@@ -827,6 +1228,11 @@ async function main() {
     cam.update();
     scene.world.aperture = s.aperture;
     scene.world.focusDistance = s.focusDistance;
+    // Drive the sky/sun from the interpolated time of day, then layer the
+    // explicitly-keyed exposure + haze on top (applyTimeOfDay also sets exposure).
+    scene.applyTimeOfDay(s.timeOfDay);
+    scene.world.exposure = s.exposure;
+    scene.world.hazeDensity = s.haze;
     if (s.objects && s.objects.length) {
       const byId = objectsById();
       for (const o of s.objects) {
@@ -882,6 +1288,13 @@ async function main() {
     duration: () => cutsceneDuration(cutsceneKeys),
     playing: () => cutscenePlaying,
     keyInfo: (i: number) => ({ duration: cutsceneKeys[i].duration, ease: cutsceneKeys[i].ease, time: keyTime(cutsceneKeys, i) }),
+    keyAtmo: (i: number) => ({ timeOfDay: cutsceneKeys[i].timeOfDay, exposure: cutsceneKeys[i].exposure, haze: cutsceneKeys[i].haze }),
+    // Edit an atmosphere field on a keyframe and preview it live at the playhead.
+    setKeyAtmo: (i: number, field: "timeOfDay" | "exposure" | "haze", v: number) => {
+      cutsceneKeys[i][field] = v;
+      applyCutsceneAt(cutsceneTime);
+      markDirty();
+    },
     add: () => { cutsceneKeys.push(captureKey()); normalizeCutscene(); cutsceneSel = cutsceneKeys.length - 1; cutsceneTime = keyTime(cutsceneKeys, cutsceneSel); markDirty(); ui.refresh(); },
     remove: (i: number) => { cutsceneKeys.splice(i, 1); normalizeCutscene(); cutsceneSel = Math.min(cutsceneSel, cutsceneKeys.length - 1); markDirty(); ui.refresh(); },
     recapture: (i: number) => { const k = captureKey(); k.duration = cutsceneKeys[i].duration; k.ease = cutsceneKeys[i].ease; cutsceneKeys[i] = k; normalizeCutscene(); markDirty(); ui.refresh(); },
@@ -922,6 +1335,9 @@ async function main() {
     onRerollLandform: rerollLandform,
     onAddPlanet: addPlanet,
     onNewScene: newScene,
+    onOpenGallery: openGallery,
+    onSaveToGallery: saveToGallery,
+    onImportToGallery: importToGallery,
     onSaveScene: saveScene,
     onLoadScene: loadScene,
     isEditing: () => editInstance !== null,

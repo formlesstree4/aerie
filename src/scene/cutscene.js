@@ -66,6 +66,7 @@ const stateOf = (k) => ({
     target: [k.target[0], k.target[1], k.target[2]],
     distance: k.distance, yaw: k.yaw, pitch: k.pitch,
     aperture: k.aperture, focusDistance: k.focusDistance,
+    timeOfDay: k.timeOfDay, exposure: k.exposure, haze: k.haze,
     objects: k.objects,
 });
 /** Total play length in seconds (sum of per-segment durations). */
@@ -105,6 +106,9 @@ export function evalCutscene(keys, t) {
                 pitch: lerp(a.pitch, b.pitch, u),
                 aperture: lerp(a.aperture, b.aperture, u),
                 focusDistance: lerp(a.focusDistance, b.focusDistance, u),
+                timeOfDay: lerp(a.timeOfDay, b.timeOfDay, u),
+                exposure: lerp(a.exposure, b.exposure, u),
+                haze: lerp(a.haze, b.haze, u),
                 objects: lerpObjects(a.objects, b.objects, u),
             };
         }

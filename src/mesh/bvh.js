@@ -200,3 +200,47 @@ export function buildTLAS(mins, maxs, count) {
     build(0, count);
     return { nodes: Float32Array.from(nodes), order: idx, nodeCount: nodes.length / 8 };
 }
+// Recompute a TLAS's node AABBs in place from fresh instance AABBs, keeping the
+// existing tree topology (leaf membership + child links). Much cheaper than a
+// rebuild — no sorting, no allocation — so it can run every drag frame.
+//
+// buildTLAS emits each parent before its children (parent index < child index),
+// so iterating from the last node down to the root visits children before their
+// parent, letting internal nodes union their already-refreshed children.
+export function refitTLAS(nodes, order, nodeCount, mins, maxs) {
+    for (let ni = nodeCount - 1; ni >= 0; ni--) {
+        const o = ni * 8;
+        const b = nodes[o + 7]; // leaf: count > 0; internal: -(rightChild + 1) < 0
+        let lx = Infinity, ly = Infinity, lz = Infinity;
+        let hx = -Infinity, hy = -Infinity, hz = -Infinity;
+        if (b > 0) {
+            const first = nodes[o + 3];
+            for (let k = 0; k < b; k++) {
+                const ii = order[first + k];
+                lx = Math.min(lx, mins[ii * 3]);
+                ly = Math.min(ly, mins[ii * 3 + 1]);
+                lz = Math.min(lz, mins[ii * 3 + 2]);
+                hx = Math.max(hx, maxs[ii * 3]);
+                hy = Math.max(hy, maxs[ii * 3 + 1]);
+                hz = Math.max(hz, maxs[ii * 3 + 2]);
+            }
+        }
+        else {
+            const lo = nodes[o + 3] * 8; // left child node
+            const ro = (-b - 1) * 8; // right child node
+            lx = Math.min(nodes[lo], nodes[ro]);
+            ly = Math.min(nodes[lo + 1], nodes[ro + 1]);
+            lz = Math.min(nodes[lo + 2], nodes[ro + 2]);
+            hx = Math.max(nodes[lo + 4], nodes[ro + 4]);
+            hy = Math.max(nodes[lo + 5], nodes[ro + 5]);
+            hz = Math.max(nodes[lo + 6], nodes[ro + 6]);
+        }
+        nodes[o] = lx;
+        nodes[o + 1] = ly;
+        nodes[o + 2] = lz;
+        nodes[o + 4] = hx;
+        nodes[o + 5] = hy;
+        nodes[o + 6] = hz;
+        // Child links (o+3, o+7) are left untouched — topology is preserved.
+    }
+}
