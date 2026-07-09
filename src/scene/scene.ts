@@ -330,6 +330,7 @@ export interface World {
   waterReflectivity: number; // Fresnel F0
   exposure: number;
   warmth: number;
+  giBounces: number;      // indirect diffuse bounces (0 = fast direct-only/legacy look)
   aperture: number;       // thin-lens radius (world units); 0 = pinhole (DoF off)
   focusDistance: number;  // distance to the sharp focal plane (world units)
   timeOfDay: number;      // 0..24 hours; drives the sun arc + sky tint (applyTimeOfDay)
@@ -383,6 +384,7 @@ export function defaultWorld(): World {
     waterReflectivity: 0.02,
     exposure: 1.05,
     warmth: 0.5,
+    giBounces: 2,
     aperture: 0,
     focusDistance: 60,
     timeOfDay: 12,

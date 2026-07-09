@@ -335,6 +335,7 @@ export function defaultWorld() {
         waterReflectivity: 0.02,
         exposure: 1.05,
         warmth: 0.5,
+        giBounces: 2,
         aperture: 0,
         focusDistance: 60,
         timeOfDay: 12,

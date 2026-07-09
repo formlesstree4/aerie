@@ -1022,6 +1022,135 @@ async function main() {
   // cutscene) owns the GPU and uniforms.
   let offlineRendering = false;
 
+  // A non-dismissable, full-screen modal shown for the duration of an off-screen
+  // WebM export. The backdrop covers (and so blocks pointer input to) every panel
+  // and dock, and we also swallow keyboard shortcuts — the export owns the camera
+  // and uniforms, so the scene must not be editable while it runs. There is no
+  // close affordance; it is torn down only when the render finishes or fails.
+  function showRenderModal(label: string): {
+    update: (done: number, total: number, sub: string, etaMs: number) => void;
+    cancelled: () => boolean;
+    close: () => void;
+  } {
+    // Human-readable "time left" from a millisecond estimate. Empty until we
+    // have a real estimate (etaMs <= 0), so the first frame reads "estimating…".
+    const fmtETA = (ms: number): string => {
+      if (!isFinite(ms) || ms <= 0) return "";
+      const s = Math.ceil(ms / 1000);
+      const m = Math.floor(s / 60);
+      return m > 0 ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`;
+    };
+
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    backdrop.style.zIndex = "200"; // above menubar/docks/panels
+    const box = document.createElement("div");
+    box.className = "modal";
+    const title = document.createElement("div");
+    title.className = "modal-title";
+    title.textContent = `Rendering ${label}…`;
+    const msg = document.createElement("div");
+    msg.className = "modal-msg";
+    msg.textContent = "Preparing…";
+    const bar = document.createElement("div");
+    bar.style.cssText =
+      "height:8px;border-radius:5px;border:1px solid var(--line);" +
+      "background:rgba(120,170,255,0.12);overflow:hidden;";
+    const fill = document.createElement("div");
+    fill.style.cssText =
+      "height:100%;width:0%;background:rgba(140,200,255,0.8);transition:width 0.12s linear;";
+    bar.append(fill);
+    const hint = document.createElement("div");
+    hint.className = "modal-msg";
+    hint.style.cssText = "margin:10px 0 0;opacity:0.55;";
+    hint.textContent = "Editing is disabled until the render finishes.";
+
+    let cancelled = false;
+    const btns = document.createElement("div");
+    btns.className = "modal-btns";
+    btns.style.marginTop = "14px";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "btn";
+    cancelBtn.textContent = "Cancel render";
+    cancelBtn.addEventListener("click", () => {
+      cancelled = true;
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = "Cancelling…";
+      title.textContent = `Cancelling ${label}…`;
+      // The current frame must finish tracing before the loop can bail; note that.
+      hint.textContent = "Finishing the current frame, then stopping…";
+    });
+    btns.append(cancelBtn);
+    box.append(title, msg, bar, hint, btns);
+    backdrop.append(box);
+
+    // Swallow every key while the export runs so shortcuts can't fly the camera
+    // or mutate the scene under the render. Pointer input is already blocked by
+    // the backdrop; clicks on it do nothing (no dismiss).
+    const swallowKey = (e: KeyboardEvent) => { e.stopPropagation(); };
+    document.addEventListener("keydown", swallowKey, true);
+    document.addEventListener("keyup", swallowKey, true);
+    backdrop.addEventListener("click", (e) => e.stopPropagation());
+    document.body.append(backdrop);
+
+    return {
+      update: (done, total, sub, etaMs) => {
+        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+        fill.style.width = `${pct}%`;
+        const eta = fmtETA(etaMs);
+        const tail = cancelled ? "" : eta ? ` · ~${eta} left` : done > 0 ? " · estimating…" : "";
+        msg.textContent = `${sub} · ${done}/${total} · ${pct}%${tail}`;
+      },
+      cancelled: () => cancelled,
+      close: () => {
+        document.removeEventListener("keydown", swallowKey, true);
+        document.removeEventListener("keyup", swallowKey, true);
+        backdrop.remove();
+      },
+    };
+  }
+
+  // Asked after a cancelled export: keep the frames that made it, or throw them
+  // away? Resolves true = save the partial clip. Backdrop click or Esc = discard.
+  function askPartialSave(label: string, done: number, total: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const backdrop = document.createElement("div");
+      backdrop.className = "modal-backdrop";
+      backdrop.style.zIndex = "200";
+      const box = document.createElement("div");
+      box.className = "modal";
+      const title = document.createElement("div");
+      title.className = "modal-title";
+      title.textContent = `${label} cancelled`;
+      const msg = document.createElement("div");
+      msg.className = "modal-msg";
+      msg.textContent = `${done} of ${total} frames rendered. Save the partial video?`;
+      const btns = document.createElement("div");
+      btns.className = "modal-btns";
+      const close = (val: boolean) => {
+        document.removeEventListener("keydown", onKey, true);
+        backdrop.remove();
+        resolve(val);
+      };
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === "Escape") { e.stopPropagation(); close(false); }
+      };
+      const mk = (lbl: string, val: boolean, primary = false) => {
+        const b = document.createElement("button");
+        b.className = "btn" + (primary ? " primary" : "");
+        b.textContent = lbl;
+        b.addEventListener("click", () => close(val));
+        return b;
+      };
+      btns.append(mk("Save partial", true, true), mk("Discard", false));
+      box.append(title, msg, btns);
+      backdrop.append(box);
+      backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(false); });
+      document.addEventListener("keydown", onKey, true);
+      document.body.append(backdrop);
+    });
+  }
+
   // Encode an off-screen render to WebM with WebCodecs. Each frame is stamped
   // with an explicit presentation timestamp (i / fps), so the clip's duration is
   // exactly frames/fps regardless of how long each frame takes to ray-trace —
@@ -1065,16 +1194,12 @@ async function main() {
     const usPerFrame = 1_000_000 / fps;
 
     offlineRendering = true;
-    try {
-      for (let i = 0; i < frames; i++) {
-        const px = await renderFrame(i);
-        ctx.putImageData(new ImageData(px, W, H), 0, 0);
-        const vf = new VideoFrame(cnv, { timestamp: Math.round(i * usPerFrame), duration: Math.round(usPerFrame) });
-        encoder.encode(vf, { keyFrame: i % fps === 0 }); // a keyframe each second for seeking
-        vf.close();
-        hud.textContent = `${label} ${i + 1}/${frames} · ${W}×${H}`;
-        if (encoder.encodeQueueSize > 6) await new Promise((r) => setTimeout(r, 0)); // light backpressure
-      }
+    const modal = showRenderModal(label);
+    modal.update(0, frames, `${W}×${H}`, 0);
+    const startMs = performance.now();
+    let done = 0;
+    // Flush whatever frames the encoder has, mux them, and trigger the download.
+    const saveClip = async (partial: boolean) => {
       await encoder.flush();
       muxer.finalize();
       const blob = new Blob([muxer.target.buffer], { type: "video/webm" });
@@ -1084,13 +1209,44 @@ async function main() {
       a.download = name;
       a.click();
       URL.revokeObjectURL(url);
-      hud.textContent = `${label} saved · ${frames} frames @ ${fps}fps (${(frames / fps).toFixed(1)}s)`;
+      hud.textContent = partial
+        ? `${label} saved (partial) · ${done} frames @ ${fps}fps`
+        : `${label} saved · ${frames} frames @ ${fps}fps (${(frames / fps).toFixed(1)}s)`;
+    };
+    try {
+      for (let i = 0; i < frames; i++) {
+        if (modal.cancelled()) break; // abort before starting the next frame
+        const px = await renderFrame(i);
+        ctx.putImageData(new ImageData(px, W, H), 0, 0);
+        const vf = new VideoFrame(cnv, { timestamp: Math.round(i * usPerFrame), duration: Math.round(usPerFrame) });
+        encoder.encode(vf, { keyFrame: i % fps === 0 }); // a keyframe each second for seeking
+        vf.close();
+        done = i + 1;
+        // ETA from the running average frame time × frames still to go.
+        const eta = (performance.now() - startMs) / done * (frames - done);
+        hud.textContent = `${label} ${done}/${frames} · ${W}×${H}`;
+        modal.update(done, frames, `${W}×${H}`, eta);
+        if (encoder.encodeQueueSize > 6) await new Promise((r) => setTimeout(r, 0)); // light backpressure
+      }
+      if (modal.cancelled()) {
+        // Take down the blocking overlay, then ask whether to keep the frames
+        // rendered so far. Nothing to offer if the abort landed before frame 1.
+        modal.close();
+        if (done > 0 && await askPartialSave(label, done, frames)) {
+          await saveClip(true);
+        } else {
+          hud.textContent = `${label} cancelled · ${done}/${frames} frames`;
+        }
+      } else {
+        await saveClip(false);
+      }
     } catch (e) {
       hud.textContent = `${label} failed: ${e instanceof Error ? e.message : e}`;
     } finally {
       try { encoder.close(); } catch { /* already closed */ }
       renderer.resetAccumulation();
       offlineRendering = false;
+      modal.close();
     }
   }
 

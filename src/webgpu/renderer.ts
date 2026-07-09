@@ -44,6 +44,7 @@ export class Renderer {
   private warmth = 0.5;
   private aperture = 0;
   private focusDistance = 60;
+  private giBounces = 2;
   // 6 base + 3 star + 3 terrain-color + 3 recipe vec4 + MAX_CLOUD_LAYERS × 3 vec4.
   private readonly worldData = new Float32Array((15 + MAX_CLOUD_LAYERS * 3) * 4);
   private computePipeline: GPUComputePipeline;
@@ -340,6 +341,7 @@ export class Renderer {
     this.warmth = w.warmth;
     this.aperture = w.aperture;
     this.focusDistance = w.focusDistance;
+    this.giBounces = w.giBounces;
     this.starsFlag = w.starsEnabled ? 1 : 0;
     this.resetAccumulation();
   }
@@ -560,7 +562,7 @@ export class Renderer {
     // row 8: sunColor, starsFlag
     d[32] = this.sunColorV.x; d[33] = this.sunColorV.y; d[34] = this.sunColorV.z; d[35] = this.starsFlag;
     // row 9: aperture, focusDistance, pad, pad (thin-lens depth of field)
-    d[36] = this.aperture; d[37] = this.focusDistance; d[38] = 0; d[39] = 0;
+    d[36] = this.aperture; d[37] = this.focusDistance; d[38] = this.giBounces; d[39] = 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, d);
   }
 

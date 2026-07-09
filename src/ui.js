@@ -1207,6 +1207,8 @@ export function buildUI(scene, getSpawn, hooks) {
             box.append(worldSlider("exposure", w.exposure, 0.2, 3, 0.02, (v) => (w.exposure = v)));
             box.append(worldSlider("warmth", w.warmth, 0, 1, 0.02, (v) => (w.warmth = v)));
             box.append(worldSlider("haze", w.hazeDensity, 0, 0.01, 0.0002, (v) => (w.hazeDensity = v)));
+            box.append(worldSlider("GI bounces", w.giBounces, 0, 4, 1, (v) => (w.giBounces = Math.round(v))));
+            box.append(el("div", "hint", "Indirect light bounces — color bleeding & sky fill. 0 = fast, direct-only."));
             box.append(group("Depth of field", (g) => {
                 g.append(worldSlider("aperture", w.aperture, 0, 4, 0.02, (v) => (w.aperture = v)));
                 g.append(worldSlider("focus dist", w.focusDistance, 2, 320, 0.5, (v) => (w.focusDistance = v)));

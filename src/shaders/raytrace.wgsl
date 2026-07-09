@@ -15,7 +15,7 @@ struct Uniforms {
   primCount : f32,  lightCount  : f32, instCount : f32, sunFlag : f32,
   pickX     : f32,  pickY       : f32, _pad3 : f32, _pad4 : f32,
   sunColor  : vec3f, starsFlag  : f32,
-  aperture  : f32,  focusDist   : f32, _pad5 : f32, _pad6 : f32,  // thin-lens DoF
+  aperture  : f32,  focusDist   : f32, giBounces : f32, _pad6 : f32,  // thin-lens DoF; giBounces = indirect diffuse bounces
 };
 
 struct Tri {
@@ -1133,14 +1133,27 @@ fn cosineHemisphere(n: vec3f) -> vec3f {
 const AO_DIST  = 14.0;
 const AO_FLOOR = 0.35;
 
-// Direct + ambient lighting for a diffuse point.
-fn shade(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
-  // Skylight ambient (sun-driven), attenuated by local sky visibility so contact
-  // points and crevices darken — this grounds objects instead of leaving them
-  // looking pasted onto the scene.
+// Skylight ambient (sun-driven), attenuated by local sky visibility so contact
+// points and crevices darken — this grounds objects instead of leaving them
+// looking pasted onto the scene. This is a *stand-in* for indirect light and is
+// dropped once real GI bounces are enabled (they carry the sky in for real).
+fn skyAmbient(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
   var ambient = skyGradient(n) * skyLightAmt() * 0.30 * albedo;
   if (occluded(pos, cosineHemisphere(n), AO_DIST)) { ambient *= AO_FLOOR; }
-  var col = ambient;
+  return ambient;
+}
+
+// The sky seen by an indirect (GI) bounce ray: the lit gradient only — no sun
+// disk, glow, halo, or clouds. The sun is sampled directly (NEE) at each diffuse
+// vertex, so re-counting its disk here would double the sun and spray fireflies.
+fn skyDome(dir: vec3f) -> vec3f {
+  return skyGradient(dir) * skyLightAmt();
+}
+
+// Direct lighting (next-event estimation) for a diffuse point: emission-free,
+// ambient-free — just the explicit lights, shadow-tested.
+fn directLight(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
+  var col = vec3f(0.0);
   let n_lights = i32(u.lightCount);
   for (var i = 0; i < n_lights; i = i + 1) {
     let lt = lights[i];
@@ -1174,12 +1187,28 @@ fn shade(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
   return col;
 }
 
+// Direct + ambient lighting for a diffuse point (legacy Whitted look).
+fn shade(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
+  return skyAmbient(pos, n, albedo) + directLight(pos, n, albedo);
+}
+
+// Color deposited at a diffuse vertex. With GI on, indirect light (sky + bounces)
+// arrives through the continued ray, so we keep only direct light and drop the
+// sky-ambient stand-in that would otherwise double the fill. With GI off, we keep
+// the ambient term so the classic look is byte-for-byte unchanged.
+fn litDiffuse(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
+  if (u.giBounces > 0.5) { return directLight(pos, n, albedo); }
+  return skyAmbient(pos, n, albedo) + directLight(pos, n, albedo);
+}
+
 fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
   var ro = ro0;
   var rd = rd0;
   var throughput = vec3f(1.0);
   var radiance = vec3f(0.0);
   var primaryDist = -1.0;
+  var giUsed = 0;         // indirect diffuse bounces taken so far
+  var diffuseGI = false;  // path has scattered diffusely → sky misses use the dome
 
   for (var bounce = 0; bounce < MAX_BOUNCE; bounce = bounce + 1) {
     // Early-out low-contribution paths: once the accumulated reflection/transmission
@@ -1193,7 +1222,11 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
     if (bounce == 0) { primaryDist = select(1e9, h.t, h.kind != 0); }
 
     if (h.kind == 0) {
-      radiance += throughput * skyClouds(ro, rd);
+      // A specular/primary miss shows the real sky (sun disk + clouds) so mirrors
+      // and water reflect it; a diffuse-GI bounce that escapes takes only the
+      // sunless dome to avoid double-counting the directly-sampled sun.
+      if (diffuseGI) { radiance += throughput * skyDome(rd); }
+      else { radiance += throughput * skyClouds(ro, rd); }
       break;
     }
 
@@ -1225,7 +1258,16 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
       radiance += throughput * lt.ring1.rgb * lit;
       break;
     } else if (h.kind == 1) {
-      radiance += throughput * shade(h.pos, n, terrainColor(h.pos, n));
+      let tcol = terrainColor(h.pos, n);
+      radiance += throughput * litDiffuse(h.pos, n, tcol);
+      if (u.giBounces > 0.5 && giUsed < i32(u.giBounces)) {
+        giUsed = giUsed + 1;
+        diffuseGI = true;
+        throughput *= tcol;
+        ro = h.pos + n * 0.02;
+        rd = cosineHemisphere(n);
+        continue;
+      }
       break;
     } else if (h.kind == 4) {
       let pr = prims[h.primIdx];
@@ -1235,11 +1277,22 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
       let albedo = patternColor(pr, pl, nl);
       let nn = bumpNormal(h.pos, n, pr.mat2.y, pr.mat2.z);
       let refl = pr.mat0.w;
-      radiance += throughput * (1.0 - refl) * shade(h.pos, nn, albedo);
       if (refl > 0.002) {
+        // Reflective: deterministic split — deposit the matte fraction now, then
+        // continue the mirror ray. (GI is applied only to fully-matte surfaces.)
+        radiance += throughput * (1.0 - refl) * shade(h.pos, nn, albedo);
         throughput *= refl * mix(vec3f(1.0), albedo, 0.15);
         ro = h.pos + nn * 0.01;
         rd = reflect(rd, nn);
+        continue;
+      }
+      radiance += throughput * litDiffuse(h.pos, nn, albedo);
+      if (u.giBounces > 0.5 && giUsed < i32(u.giBounces)) {
+        giUsed = giUsed + 1;
+        diffuseGI = true;
+        throughput *= albedo;
+        ro = h.pos + nn * 0.02;
+        rd = cosineHemisphere(nn);
         continue;
       }
       break;
@@ -1258,14 +1311,24 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
       let metallic = mtl.params.x;
       let roughness = mtl.params.y;
       radiance += throughput * mtl.emis.rgb;
-      radiance += throughput * (1.0 - metallic) * shade(h.pos, nn, albedo);
       if (metallic > 0.02) {
-        // Colored metal: tint the reflection by albedo, and let roughness blur it
-        // a lot at the top end so rough metals read matte instead of chrome.
+        // Colored metal: deposit the matte fraction, then tint the reflection by
+        // albedo and let roughness blur it a lot at the top end so rough metals
+        // read matte instead of chrome. (GI is applied only to matte surfaces.)
+        radiance += throughput * (1.0 - metallic) * shade(h.pos, nn, albedo);
         throughput *= metallic * mix(vec3f(1.0), albedo, 0.65);
         let refl = reflect(rd, nn);
         rd = coneSample(refl, clamp(roughness * roughness * 1.5, 0.02, 1.2));
         ro = h.pos + nn * 0.02;
+        continue;
+      }
+      radiance += throughput * litDiffuse(h.pos, nn, albedo);
+      if (u.giBounces > 0.5 && giUsed < i32(u.giBounces)) {
+        giUsed = giUsed + 1;
+        diffuseGI = true;
+        throughput *= albedo;
+        ro = h.pos + nn * 0.02;
+        rd = cosineHemisphere(nn);
         continue;
       }
       break;
