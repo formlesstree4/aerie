@@ -12,8 +12,10 @@ import {
   CLOUD_LABELS,
   MAX_CLOUD_LAYERS,
   MAX_BOOL_GROUPS,
+  Emitter,
   type Selectable,
 } from "./scene/scene";
+import { EmitterType, EMITTER_LABELS, defaultEmitter } from "./gen/particles";
 import { acceptAttribute } from "./mesh/modelImport";
 import { LANDSCAPE_LABELS, LANDSCAPE_TYPES, type LandscapeType } from "./mesh/landscape";
 import type { Ease } from "./scene/cutscene";
@@ -1204,6 +1206,50 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
       }
     }
 
+    if (selected instanceof Emitter) {
+      const e = selected;
+      const typeOpts: [number, string][] = ([EmitterType.Campfire, EmitterType.Explosion,
+        EmitterType.Smoke, EmitterType.Sparks, EmitterType.Fireworks, EmitterType.Magic] as const)
+        .map((t) => [t, EMITTER_LABELS[t]]);
+      box.append(dropdown("type", e.type, typeOpts, (v) => {
+        // Switching archetype re-seeds every param from that type's defaults.
+        const d = defaultEmitter(v as EmitterType);
+        e.type = v as EmitterType;
+        e.count = d.count; e.size = d.size; e.speed = d.speed; e.spread = d.spread;
+        e.gravity = d.gravity; e.lifetime = d.lifetime; e.intensity = d.intensity;
+        e.colorA = [...d.colorA]; e.colorB = [...d.colorB]; e.loop = d.loop; e.burstTime = d.burstTime;
+        refresh();
+      }));
+      box.append(group("Transform", (g) => {
+        g.append(slider("pos x", e.position.x, -120, 120, 0.5, (v) => (e.position.x = v)));
+        g.append(slider("pos y", e.position.y, -10, 120, 0.5, (v) => (e.position.y = v)));
+        g.append(slider("pos z", e.position.z, -120, 120, 0.5, (v) => (e.position.z = v)));
+      }));
+      box.append(group("Emission", (g) => {
+        g.append(slider("count", e.count, 4, 512, 1, (v) => (e.count = Math.round(v))));
+        g.append(slider("size", e.size, 0.02, 5, 0.02, (v) => (e.size = v)));
+        g.append(slider("speed", e.speed, 0, 40, 0.5, (v) => (e.speed = v)));
+        g.append(slider("spread", e.spread, 0, 3, 0.02, (v) => (e.spread = v)));
+        g.append(slider("gravity", e.gravity, -20, 30, 0.5, (v) => (e.gravity = v)));
+        g.append(slider("lifetime", e.lifetime, 0.2, 8, 0.1, (v) => (e.lifetime = v)));
+        g.append(slider("intensity", e.intensity, 0, 6, 0.05, (v) => (e.intensity = v)));
+      }));
+      box.append(group("Timing", (g) => {
+        g.append(dropdown("mode", e.loop ? 1 : 0,
+          [[1, "Loop (continuous)"], [0, "One-shot (burst)"]], (v) => { e.loop = v === 1; refresh(); }));
+        if (!e.loop) g.append(slider("burst @", e.burstTime, 0, 10, 0.05, (v) => (e.burstTime = v)));
+        g.append(slider("seed", e.seed, 1, 999, 1, (v) => (e.seed = Math.round(v))));
+      }));
+      box.append(group("Color", (g) => {
+        g.append(el("div", "hint", "young (hot)"));
+        g.append(colorPicker(e.colorA, () => {}));
+        g.append(el("div", "hint", "aged (cool)"));
+        g.append(colorPicker(e.colorB, () => {}));
+      }));
+      box.append(el("div", "hint",
+        "Emitters flicker live in Preview. In Render they freeze at the timeline moment — scrub the cutscene or export a WebM to animate them."));
+    }
+
     const footer = el("div", "insp-footer");
     const mirrorRow = el("div", "btns");
     mirrorRow.append(el("label", "lab", "mirror"));
@@ -1231,14 +1277,16 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
   // --- object list ---
   function buildList(): HTMLDivElement {
     const list = el("div", "list");
-    const items: Selectable[] = [...scene.prims, ...scene.instances, ...scene.lights];
+    const items: Selectable[] = [...scene.prims, ...scene.instances, ...scene.lights, ...scene.emitters];
     for (const item of items) {
       let tag =
         item instanceof Primitive
           ? PRIM_LABELS[item.type]
           : item instanceof MeshInstance
             ? "Model"
-            : "Light";
+            : item instanceof Emitter
+              ? EMITTER_LABELS[item.type]
+              : "Light";
       if (item instanceof Primitive || item instanceof MeshInstance) {
         if (item.subtractive) tag += " ⊖";
         if (item.group > 0) tag += ` g${item.group}`;
@@ -1427,7 +1475,9 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
       box.append(worldSlider("warmth", w.warmth, 0, 1, 0.02, (v) => (w.warmth = v)));
       box.append(worldSlider("haze", w.hazeDensity, 0, 0.01, 0.0002, (v) => (w.hazeDensity = v)));
       box.append(worldSlider("GI bounces", w.giBounces, 0, 4, 1, (v) => (w.giBounces = Math.round(v))));
-      box.append(el("div", "hint", "Indirect light bounces — color bleeding & sky fill. 0 = fast, direct-only."));
+      box.append(el("div", "hint", "Indirect light — color bleed & sky fill. Refines in when the view is still; 0 = off."));
+      box.append(worldSlider("god rays", w.shaftStrength, 0, 3, 0.05, (v) => (w.shaftStrength = v)));
+      box.append(el("div", "hint", "Volumetric sun shafts (pricey). Refines in when still — best for hero renders. 0 = off."));
 
       box.append(group("Depth of field", (g) => {
         g.append(worldSlider("aperture", w.aperture, 0, 4, 0.02, (v) => (w.aperture = v)));
@@ -1484,6 +1534,10 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
       pop.append(menuItem("Sun", () => { selection = [scene.addLight(LightType.Directional)]; hooks.onCommit(); }));
       pop.append(menuItem("Point", () => { selection = [scene.addLight(LightType.Point, getSpawn())]; hooks.onCommit(); }));
       pop.append(menuItem("Planet", () => hooks.onAddPlanet()));
+      pop.append(el("div", "sec", "Effects"));
+      ([EmitterType.Campfire, EmitterType.Explosion, EmitterType.Smoke,
+        EmitterType.Sparks, EmitterType.Fireworks, EmitterType.Magic] as const).forEach((t) =>
+        pop.append(menuItem(EMITTER_LABELS[t], () => { selection = [scene.addEmitter(t, getSpawn())]; hooks.onCommit(); })));
     });
 
     const toolsMenu = menu("tools", "Tools", (pop) => {

@@ -15,7 +15,9 @@ struct Uniforms {
   primCount : f32,  lightCount  : f32, instCount : f32, sunFlag : f32,
   pickX     : f32,  pickY       : f32, _pad3 : f32, _pad4 : f32,
   sunColor  : vec3f, starsFlag  : f32,
-  aperture  : f32,  focusDist   : f32, giBounces : f32, _pad6 : f32,  // thin-lens DoF; giBounces = indirect diffuse bounces
+  aperture  : f32,  focusDist   : f32, giBounces : f32, shaftStr : f32,  // thin-lens DoF; giBounces = indirect diffuse bounces; shaftStr = god-ray strength
+  partCount : f32,  shutter     : f32, _p0 : f32, _p1 : f32,  // particle count; shutter = motion-blur time (1/fps, 0 = none)
+  partBound : vec3f, partRadius : f32,  // bounding sphere over all live particles (whole-cloud ray reject)
 };
 
 struct Tri {
@@ -97,6 +99,11 @@ fn lightRadius(lt: Light) -> f32 {
 // indices) rather than the triangle pool.
 @group(0) @binding(14) var<storage, read> tlasNodes : array<Node>;
 @group(0) @binding(15) var<storage, read> tlasOrder : array<u32>;
+// Emissive particle field (campfires, explosions, …). Each particle is an
+// additive glowing blob; see particleEmission(). p0 = pos.xyz + radius,
+// p1 = color.rgb (HDR) + opacity, p2 = velocity.xyz + pad (for motion blur).
+struct Particle { p0 : vec4f, p1 : vec4f, p2 : vec4f };
+@group(0) @binding(16) var<storage, read> particles : array<Particle>;
 
 struct CloudLayer {
   a : vec4f,  // type, coverage, density, scale
@@ -126,6 +133,9 @@ struct World {
 const PI = 3.14159265359;
 const MAX_BOUNCE = 5;
 const WATER_Y    = 0.0;
+const SHAFT_STEPS = 14;      // ray-march samples for volumetric light shafts
+const SHAFT_MAX   = 420.0;   // how far into the air shafts are integrated
+const SHAFT_G     = 0.72;    // forward-scatter anisotropy → beams glow toward the sun
 
 // ---------------------------------------------------------------- hashing / rng
 fn hash21(p: vec2f) -> f32 {
@@ -1180,6 +1190,13 @@ fn directLight(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
     }
     let ndl = max(dot(n, L), 0.0);
     if (ndl <= 0.0) { continue; }
+    // Cull lights whose (pre-shadow) contribution is negligible BEFORE paying for
+    // the shadow march. Critical for local point lights — e.g. an emitter fill-
+    // light — which reach only a small area but would otherwise shadow-march the
+    // whole scene toward themselves on every pixel. The sun/planets have atten≈1
+    // so they never trip this.
+    let bright = max(lt.color.x, max(lt.color.y, lt.color.z));
+    if (lt.data.y * atten * ndl * bright < 0.0015) { continue; }
     let Lj = coneSample(L, max(lt.data.z, 0.001));
     let vis = select(1.0, 0.0, occluded(pos, Lj, maxD));
     col += albedo * lt.color.xyz * (lt.data.y * ndl * atten * vis);
@@ -1192,13 +1209,89 @@ fn shade(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
   return skyAmbient(pos, n, albedo) + directLight(pos, n, albedo);
 }
 
-// Color deposited at a diffuse vertex. With GI on, indirect light (sky + bounces)
+// Is indirect GI live for THIS sample? Interaction resets accumulation every
+// frame, so sample 0 (frame 0) always renders the cheap direct-lit baseline —
+// keeping orbit/edit fully interactive — while the refinement samples that build
+// up when the camera is still add the (expensive) bounced light. The converged
+// image is essentially unchanged: the single cheap sample is <1% of the total.
+fn giActive() -> bool {
+  return u.giBounces > 0.5 && u.frame >= 1.0;
+}
+
+// Color deposited at a diffuse vertex. With GI live, indirect light (sky + bounces)
 // arrives through the continued ray, so we keep only direct light and drop the
-// sky-ambient stand-in that would otherwise double the fill. With GI off, we keep
-// the ambient term so the classic look is byte-for-byte unchanged.
+// sky-ambient stand-in that would otherwise double the fill. Otherwise we keep the
+// ambient term so the cheap baseline sample still looks grounded.
 fn litDiffuse(pos: vec3f, n: vec3f, albedo: vec3f) -> vec3f {
-  if (u.giBounces > 0.5) { return directLight(pos, n, albedo); }
+  if (giActive()) { return directLight(pos, n, albedo); }
   return skyAmbient(pos, n, albedo) + directLight(pos, n, albedo);
+}
+
+// Volumetric single-scatter light shafts (crepuscular rays). Marches the primary
+// ray through the hazy air and, at each step, tests sun visibility (terrain +
+// geometry). Lit air in-scatters sunlight toward the eye; shadowed air stays
+// dark — so beams rake out from behind ridgelines and objects. A jittered start
+// offset trades banding for noise that progressive accumulation averages away.
+// Sun-only and opt-in via the strength slider; costs nothing when off or at night.
+fn godRays(ro: vec3f, rd: vec3f, hitDist: f32) -> vec3f {
+  // Off, sunless, or the cheap interaction sample (frame 0) → skip entirely. The
+  // 20-step shadow march is far too costly to run while orbiting; it only refines
+  // in once the camera settles (see giActive()).
+  if (u.shaftStr <= 0.0 || u.sunFlag < 0.5 || u.frame < 1.0) { return vec3f(0.0); }
+  let sun = normalize(u.sunDir);
+  // Integrate to the first surface, but never past SHAFT_MAX (sky pixels march
+  // the full bounded span so shafts read against the sky too).
+  let far = min(select(SHAFT_MAX, hitDist, hitDist < 1e8), SHAFT_MAX);
+  let ds = far / f32(SHAFT_STEPS);
+  let sigma = 0.014 * u.shaftStr;      // scattering coefficient (also self-attenuation)
+  let phase = hg(dot(rd, sun), SHAFT_G);
+  var t = ds * rand();                 // jitter the first step to break up banding
+  var acc = 0.0;
+  for (var i = 0; i < SHAFT_STEPS; i = i + 1) {
+    let p = ro + rd * t;
+    if (!occluded(p, sun, 800.0)) {
+      acc += exp(-sigma * t) * ds;     // transmittance-weighted in-scatter of lit air
+    }
+    t += ds;
+  }
+  return acc * sigma * phase * u.sunColor * skyLightAmt();
+}
+
+// Additive emission from the particle field along a ray. Each particle is a soft
+// glowing blob: we take the ray's closest approach to the particle centre and add
+// its (opacity-weighted) colour with a smooth radial falloff — no occlusion, so
+// blobs blend additively like real fire/sparks. Particles past `maxT` are hidden
+// behind the scene surface and skipped. Sub-frame motion blur comes for free by
+// advancing each particle along its velocity by a random slice of the shutter.
+fn particleEmission(ro: vec3f, rd: vec3f, maxT: f32) -> vec3f {
+  let n = i32(u.partCount);
+  if (n <= 0) { return vec3f(0.0); }
+  // Whole-cloud bounding-sphere reject: most rays don't look anywhere near the
+  // particles, so one sphere test skips the entire per-particle loop for them.
+  let ocb = u.partBound - ro;
+  let tcab = dot(ocb, rd);
+  let d2b = dot(ocb, ocb) - tcab * tcab;
+  if (d2b > u.partRadius * u.partRadius) { return vec3f(0.0); }   // ray misses the cloud
+  if (tcab + u.partRadius < 0.0) { return vec3f(0.0); }           // cloud entirely behind the eye
+  if (tcab - u.partRadius > maxT) { return vec3f(0.0); }          // cloud entirely behind the surface
+  let dt = u.shutter * rand();
+  var acc = vec3f(0.0);
+  for (var i = 0; i < n; i = i + 1) {
+    let pt = particles[i];
+    let op = pt.p1.w;
+    if (op <= 0.003) { continue; }              // dead / recycled slot
+    let c = pt.p0.xyz + pt.p2.xyz * dt;         // centre at the jittered instant
+    let r = pt.p0.w;
+    let oc = c - ro;
+    let tca = dot(oc, rd);                       // rd is unit length
+    if (tca <= 0.0 || tca > maxT) { continue; } // behind the eye or occluded
+    let d2 = dot(oc, oc) - tca * tca;           // squared perpendicular distance
+    let r2 = r * r;
+    if (d2 >= r2) { continue; }
+    let falloff = 1.0 - d2 / r2;                // 1 at centre → 0 at the rim
+    acc += pt.p1.xyz * (op * falloff * falloff);
+  }
+  return acc;
 }
 
 fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
@@ -1260,7 +1353,7 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
     } else if (h.kind == 1) {
       let tcol = terrainColor(h.pos, n);
       radiance += throughput * litDiffuse(h.pos, n, tcol);
-      if (u.giBounces > 0.5 && giUsed < i32(u.giBounces)) {
+      if (giActive() && giUsed < i32(u.giBounces)) {
         giUsed = giUsed + 1;
         diffuseGI = true;
         throughput *= tcol;
@@ -1287,7 +1380,7 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
         continue;
       }
       radiance += throughput * litDiffuse(h.pos, nn, albedo);
-      if (u.giBounces > 0.5 && giUsed < i32(u.giBounces)) {
+      if (giActive() && giUsed < i32(u.giBounces)) {
         giUsed = giUsed + 1;
         diffuseGI = true;
         throughput *= albedo;
@@ -1323,7 +1416,7 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
         continue;
       }
       radiance += throughput * litDiffuse(h.pos, nn, albedo);
-      if (u.giBounces > 0.5 && giUsed < i32(u.giBounces)) {
+      if (giActive() && giUsed < i32(u.giBounces)) {
         giUsed = giUsed + 1;
         diffuseGI = true;
         throughput *= albedo;
@@ -1351,6 +1444,10 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
     let hazeCol = mix(world.horizon.rgb * skyLightAmt(), sky(rd0), 0.4);
     radiance = mix(radiance, hazeCol, fog * 0.85);
   }
+  // Volumetric shafts layer on top of the (already hazed) scene as additive
+  // in-scattered sunlight.
+  radiance += godRays(ro0, rd0, primaryDist);
+  radiance += particleEmission(ro0, rd0, primaryDist);
   return radiance;
 }
 

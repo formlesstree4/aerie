@@ -1,5 +1,6 @@
 import { Vector3, Euler, Quaternion, Matrix4 } from "three";
 import { TERRAIN_CATALOG, BASIS_ID, FRACTAL_ID } from "../gen/recipe";
+import { EMITTER_LABELS, defaultEmitter } from "../gen/particles";
 // Keep these in sync with the WGSL structs in raytrace.wgsl.
 export const MAX_PRIMS = 64;
 export const MAX_LIGHTS = 16;
@@ -258,6 +259,64 @@ export class Light {
         return l;
     }
 }
+/** A particle emitter (campfire, explosion, …). Holds the tunable spec; the
+ *  actual particle field is a stateless function of time — see gen/particles.ts.
+ *  Position is a Vector3 so it drags/animates like any other object; the rest of
+ *  the EmitterSpec fields live flat on the instance and satisfy that interface. */
+export class Emitter {
+    type;
+    id = nextId++;
+    name;
+    position = new Vector3();
+    count;
+    size;
+    speed;
+    spread;
+    gravity;
+    lifetime;
+    intensity;
+    colorA;
+    colorB;
+    seed;
+    loop;
+    burstTime;
+    constructor(type) {
+        this.type = type;
+        const d = defaultEmitter(type);
+        this.name = `${EMITTER_LABELS[type]} ${this.id}`;
+        this.count = d.count;
+        this.size = d.size;
+        this.speed = d.speed;
+        this.spread = d.spread;
+        this.gravity = d.gravity;
+        this.lifetime = d.lifetime;
+        this.intensity = d.intensity;
+        this.colorA = [...d.colorA];
+        this.colorB = [...d.colorB];
+        this.seed = d.seed;
+        this.loop = d.loop;
+        this.burstTime = d.burstTime;
+    }
+    clone() {
+        const e = new Emitter(this.type);
+        e.id = this.id;
+        e.name = this.name;
+        e.position.copy(this.position);
+        e.count = this.count;
+        e.size = this.size;
+        e.speed = this.speed;
+        e.spread = this.spread;
+        e.gravity = this.gravity;
+        e.lifetime = this.lifetime;
+        e.intensity = this.intensity;
+        e.colorA = [...this.colorA];
+        e.colorB = [...this.colorB];
+        e.seed = this.seed;
+        e.loop = this.loop;
+        e.burstTime = this.burstTime;
+        return e;
+    }
+}
 // ---- clouds: stacked 2D layers, each a named meteorological type ----
 export const MAX_CLOUD_LAYERS = 4;
 // The ten meteorological genera. New values are appended (not reordered) so
@@ -335,7 +394,8 @@ export function defaultWorld() {
         waterReflectivity: 0.02,
         exposure: 1.05,
         warmth: 0.5,
-        giBounces: 2,
+        giBounces: 1,
+        shaftStrength: 0,
         aperture: 0,
         focusDistance: 60,
         timeOfDay: 12,
@@ -422,6 +482,7 @@ export class MeshInstance {
 export class Scene {
     prims = [];
     lights = [];
+    emitters = [];
     /** Bumped on any structural or property change; the renderer watches it. */
     version = 0;
     // Mesh data: per-model BLASes + global material/texture pools + instances.
@@ -782,11 +843,24 @@ export class Scene {
         this.touch();
         return l;
     }
+    addEmitter(type, at) {
+        const e = new Emitter(type);
+        if (at)
+            e.position.copy(at);
+        this.emitters.push(e);
+        this.touch();
+        return e;
+    }
     remove(item) {
         if (item instanceof Primitive) {
             const i = this.prims.indexOf(item);
             if (i >= 0)
                 this.prims.splice(i, 1);
+        }
+        else if (item instanceof Emitter) {
+            const i = this.emitters.indexOf(item);
+            if (i >= 0)
+                this.emitters.splice(i, 1);
         }
         else if (item instanceof MeshInstance) {
             const i = this.instances.indexOf(item);
@@ -804,7 +878,7 @@ export class Scene {
     }
     /** Every pickable/movable item, in list order. */
     get selectables() {
-        return [...this.prims, ...this.instances, ...this.lights];
+        return [...this.prims, ...this.instances, ...this.lights, ...this.emitters];
     }
     /** Append an independent copy of an item (fresh id; mesh copies share geometry). */
     addDuplicate(item) {
@@ -822,6 +896,13 @@ export class Scene {
             this.touch();
             return l;
         }
+        if (item instanceof Emitter) {
+            const e = item.clone();
+            e.id = nextId++;
+            this.emitters.push(e);
+            this.touch();
+            return e;
+        }
         const m = item.clone();
         m.id = nextId++;
         this.instances.push(m);
@@ -838,6 +919,7 @@ export class Scene {
         return {
             prims: this.prims.map((p) => p.clone()),
             lights: this.lights.map((l) => l.clone()),
+            emitters: this.emitters.map((e) => e.clone()),
             instances: this.instances.map((m) => m.clone()),
             world: structuredClone(this.world),
             blases: this.blases.slice(),
@@ -858,6 +940,7 @@ export class Scene {
         const replace = (arr, items) => { arr.length = 0; arr.push(...items); };
         replace(this.prims, s.prims.map((p) => p.clone()));
         replace(this.lights, s.lights.map((l) => l.clone()));
+        replace(this.emitters, s.emitters.map((e) => e.clone()));
         replace(this.instances, s.instances.map((m) => m.clone()));
         Object.assign(this.world, structuredClone(s.world));
         replace(this.blases, s.blases.slice());

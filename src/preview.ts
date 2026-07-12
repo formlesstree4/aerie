@@ -17,12 +17,19 @@ import {
   MathUtils,
   DoubleSide,
   Float32BufferAttribute,
+  Points,
+  BufferGeometry,
+  BufferAttribute,
+  ShaderMaterial,
+  AdditiveBlending,
+  DynamicDrawUsage,
 } from "three";
 import type { OrbitCamera } from "./scene/camera";
 import { Scene as AppScene, LightType, type BLAS } from "./scene/scene";
 import { previewFromBlas } from "./scene/serialize";
 import { worldTerrainHeight, worldTerrainColor } from "./gen/terrainField";
 import { primitiveLocalGeometry } from "./mesh/tessellate";
+import { evaluateEmitter, MAX_PARTICLES, PARTICLE_FLOATS } from "./gen/particles";
 
 /**
  * Real-time rasterized preview (Bryce's fast "nanopreview"). Renders the
@@ -49,6 +56,11 @@ export class Preview {
   private terrainColorSig = "";          // palette/threshold params the vertex colors were last built for
   // SDF primitives rasterized as tessellated meshes, keyed by primitive id.
   private prims = new Map<number, { mesh: Mesh; sig: string }>();
+  // Live particle field (emitters). Additive round points, world-sized, evaluated
+  // from the same stateless model the ray tracer uses so preview ≈ final render.
+  private particles: Points | null = null;
+  private particleScratch = new Float32Array(MAX_PARTICLES * PARTICLE_FLOATS);
+  private particleTime = 0; // preview-local clock (loops so one-shots replay)
   private static readonly TERRAIN_SIZE = 3000; // world units the patch covers
   private static readonly TERRAIN_SEG = 200;   // grid resolution (segments per side)
   private static readonly TERRAIN_SNAP = 250;  // patch re-centers in steps this large
@@ -312,6 +324,94 @@ export class Preview {
     }
   }
 
+  /** Build the additive round-points object the emitters draw into (lazy). */
+  private ensureParticles(): Points {
+    if (this.particles) return this.particles;
+    const g = new BufferGeometry();
+    const mk = (n: number) => new BufferAttribute(new Float32Array(MAX_PARTICLES * n), n).setUsage(DynamicDrawUsage);
+    g.setAttribute("position", mk(3));
+    g.setAttribute("psize", mk(1));
+    g.setAttribute("pcolor", mk(3));
+    // World-sized round sprites, additively blended, soft radial falloff. Colour
+    // already carries opacity baked in, so additive blending reads like real fire.
+    const mat = new ShaderMaterial({
+      uniforms: { uScale: { value: 300 } },
+      vertexShader: /* glsl */ `
+        attribute float psize;
+        attribute vec3 pcolor;
+        varying vec3 vcol;
+        uniform float uScale;
+        void main() {
+          vcol = pcolor;
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_Position = projectionMatrix * mv;
+          gl_PointSize = clamp(psize * uScale / max(-mv.z, 0.001), 1.0, 400.0);
+        }`,
+      fragmentShader: /* glsl */ `
+        varying vec3 vcol;
+        void main() {
+          vec2 d = gl_PointCoord - 0.5;
+          float r2 = dot(d, d);
+          if (r2 > 0.25) { discard; }
+          float a = 1.0 - r2 * 4.0;
+          gl_FragColor = vec4(vcol * a * a, 1.0);
+        }`,
+      transparent: true,
+      blending: AdditiveBlending,
+      depthWrite: false,
+    });
+    this.particles = new Points(g, mat);
+    this.particles.frustumCulled = false; // particles roam past the emitter's bounds
+    this.scene.add(this.particles);
+    return this.particles;
+  }
+
+  /** Evaluate every emitter at the looping preview clock and fill the points. */
+  private syncParticles(dt: number): void {
+    if (this.app.emitters.length === 0) {
+      if (this.particles) this.particles.visible = false;
+      return;
+    }
+    const pts = this.ensureParticles();
+    pts.visible = true;
+
+    // Loop the preview clock over a window so one-shot bursts replay while editing.
+    this.particleTime += dt;
+    let win = 3;
+    for (const e of this.app.emitters) win = Math.max(win, e.loop ? e.lifetime : e.burstTime + e.lifetime);
+    const t = this.particleTime % Math.min(win, 8);
+
+    const buf = this.particleScratch;
+    let count = 0;
+    for (const e of this.app.emitters) {
+      if (count >= MAX_PARTICLES) break;
+      count += evaluateEmitter(e, t, buf, count * PARTICLE_FLOATS);
+    }
+
+    const g = pts.geometry;
+    const pos = g.getAttribute("position") as BufferAttribute;
+    const psize = g.getAttribute("psize") as BufferAttribute;
+    const pcol = g.getAttribute("pcolor") as BufferAttribute;
+    const posA = pos.array as Float32Array, sizeA = psize.array as Float32Array, colA = pcol.array as Float32Array;
+    let n = 0;
+    for (let i = 0; i < count; i++) {
+      const o = i * PARTICLE_FLOATS;
+      const op = buf[o + 7];
+      if (op <= 0.003) continue; // dead/recycled slot
+      posA[n * 3] = buf[o]; posA[n * 3 + 1] = buf[o + 1]; posA[n * 3 + 2] = buf[o + 2];
+      sizeA[n] = buf[o + 3];
+      colA[n * 3] = buf[o + 4] * op; colA[n * 3 + 1] = buf[o + 5] * op; colA[n * 3 + 2] = buf[o + 6] * op;
+      n++;
+    }
+    g.setDrawRange(0, n);
+    pos.needsUpdate = true; psize.needsUpdate = true; pcol.needsUpdate = true;
+
+    // World radius → pixel size: viewport height / (2·tan(fov/2)) / depth (in vs).
+    const h = Math.max(1, this.renderer.domElement.height);
+    const fov = MathUtils.degToRad(this.camera.fov);
+    (pts.material as ShaderMaterial).uniforms.uScale.value = h / (2 * Math.tan(fov / 2));
+  }
+
   render(cam: OrbitCamera): void {
     // Terrain/water depend on the camera (patch follows the target), so refresh
     // every frame; the heavy re-displacement is guarded inside syncWorld.
@@ -328,6 +428,7 @@ export class Preview {
     this.camera.lookAt(cam.target);
     this.camera.fov = MathUtils.radToDeg(cam.fovY);
     this.camera.updateProjectionMatrix();
+    this.syncParticles(dt);
 
     // Sync the sun from the first directional light (illumination = -travel).
     const dir = this.app.lights.find((l) => l.type === LightType.Directional);

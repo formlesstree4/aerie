@@ -2,15 +2,17 @@ import raytraceWGSL from "../shaders/raytrace.wgsl?raw";
 import presentWGSL from "../shaders/present.wgsl?raw";
 import type { OrbitCamera } from "../scene/camera";
 import type { Scene } from "../scene/scene";
-import { MAX_PRIMS, MAX_LIGHTS, MAX_CLOUD_LAYERS, LIGHT_FLOATS, LightType } from "../scene/scene";
+import { MAX_PRIMS, MAX_LIGHTS, MAX_CLOUD_LAYERS, LIGHT_FLOATS, LightType, Emitter } from "../scene/scene";
+import { MAX_PARTICLES, PARTICLE_FLOATS } from "../gen/particles";
 import { buildTLAS, refitTLAS } from "../mesh/bvh";
 import { Vector3, Matrix4 } from "three";
 
-// Uniform buffer is 10 rows of vec4 = 160 bytes. Keep in sync with the WGSL structs.
-const UNIFORM_FLOATS = 40;
+// Uniform buffer is 12 rows of vec4 = 192 bytes. Keep in sync with the WGSL structs.
+const UNIFORM_FLOATS = 48;
 const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 const PRIM_BYTES = MAX_PRIMS * 36 * 4;
 const LIGHT_BYTES = MAX_LIGHTS * LIGHT_FLOATS * 4;
+const PARTICLE_BYTES = MAX_PARTICLES * PARTICLE_FLOATS * 4;
 
 export class Renderer {
   private accumBuffer!: GPUBuffer;
@@ -40,11 +42,16 @@ export class Renderer {
   private pickX = -1;
   private pickY = -1;
   private worldBuffer: GPUBuffer;
+  private particleBuffer: GPUBuffer;
+  private particleCount = 0;
+  private shutter = 0; // motion-blur shutter (seconds); set per-frame during video export
+  private readonly partBound = new Float32Array(4); // cloud bounding sphere: cx,cy,cz,radius
   private exposure = 1.05;
   private warmth = 0.5;
   private aperture = 0;
   private focusDistance = 60;
-  private giBounces = 2;
+  private giBounces = 1;
+  private shaftStr = 0;
   // 6 base + 3 star + 3 terrain-color + 3 recipe vec4 + MAX_CLOUD_LAYERS × 3 vec4.
   private readonly worldData = new Float32Array((15 + MAX_CLOUD_LAYERS * 3) * 4);
   private computePipeline: GPUComputePipeline;
@@ -116,6 +123,10 @@ export class Renderer {
       size: (15 + MAX_CLOUD_LAYERS * 3) * 16, // 6 base + 3 star + 3 terrain-color + 3 recipe + 4 clouds × 3
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    this.particleBuffer = device.createBuffer({
+      size: PARTICLE_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
 
     const computeModule = device.createShaderModule({ code: raytraceWGSL });
     this.computePipeline = device.createComputePipeline({
@@ -185,6 +196,7 @@ export class Renderer {
       { binding: 13, resource: this.primTexture.createView({ dimension: "2d-array" }) },
       { binding: 14, resource: { buffer: this.tlasBuffer } },
       { binding: 15, resource: { buffer: this.tlasOrderBuffer } },
+      { binding: 16, resource: { buffer: this.particleBuffer } },
     ];
   }
 
@@ -342,6 +354,7 @@ export class Renderer {
     this.aperture = w.aperture;
     this.focusDistance = w.focusDistance;
     this.giBounces = w.giBounces;
+    this.shaftStr = w.shaftStrength;
     this.starsFlag = w.starsEnabled ? 1 : 0;
     this.resetAccumulation();
   }
@@ -394,6 +407,20 @@ export class Renderer {
   /** Reset accumulation — call whenever the camera or scene changes. */
   resetAccumulation(): void {
     this.frame = 0;
+  }
+
+  /** Upload the evaluated particle field (packed PARTICLE_FLOATS each). `shutter`
+   *  is the motion-blur time in seconds (1/fps during video export, 0 otherwise).
+   *  Resets accumulation because the emissive field changed. */
+  uploadParticles(data: Float32Array<ArrayBuffer>, count: number, shutter = 0, bound?: Float32Array): void {
+    this.particleCount = Math.min(count, MAX_PARTICLES);
+    this.shutter = shutter;
+    if (bound) this.partBound.set(bound.subarray(0, 4));
+    else this.partBound.fill(0);
+    if (this.particleCount > 0) {
+      this.device.queue.writeBuffer(this.particleBuffer, 0, data, 0, this.particleCount * PARTICLE_FLOATS);
+    }
+    this.resetAccumulation();
   }
 
   /** Upload the global mesh pools: concatenated BLAS triangles + nodes,
@@ -524,13 +551,42 @@ export class Renderer {
     this.resetAccumulation();
   }
 
+  /** Synthesize a steady point-light for an emitter, so a campfire/etc. actually
+   *  illuminates nearby ground and objects. Particles only add self-glow along the
+   *  eye ray; this fill-light is what casts light (and soft shadows) into the
+   *  scene. Steady (not flickering) because progressive accumulation needs a
+   *  static scene — the flicker is carried by the particle glow instead. */
+  private packEmitterLight(out: Float32Array, offset: number, e: Emitter): void {
+    const [ca0, ca1, ca2] = e.colorA;
+    const mx = Math.max(ca0, ca1, ca2, 1e-3); // hue only; brightness is `intensity`
+    out[offset + 0] = LightType.Point;
+    // 1/d² falloff gets very hot up close (the light sits ~2 units up), so keep
+    // the base brightness modest and let the filmic tonemap handle the hotspot.
+    out[offset + 1] = e.intensity * 18; // fill brightness (point-light 1/d² units)
+    out[offset + 2] = 0.12;             // soft shadow
+    out[offset + 3] = Math.max(18, e.speed * e.lifetime * 1.2); // reach
+    out[offset + 4] = ca0 / mx; out[offset + 5] = ca1 / mx; out[offset + 6] = ca2 / mx;
+    out[offset + 7] = 0;                // bodyRadius: invisible (no drawn sphere)
+    out[offset + 8] = e.position.x;
+    out[offset + 9] = e.position.y + Math.max(1.5, e.size * 2); // sit up in the flame body
+    out[offset + 10] = e.position.z;
+    for (let k = 11; k < 20; k++) out[offset + k] = 0; // not-in-sky flag + ring fields
+  }
+
   /** Push the current scene (primitives + lights) to the GPU. */
   uploadScene(scene: Scene): void {
     scene.pack();
+    // Append a fill-light per emitter after the real lights (capped at MAX_LIGHTS).
+    let ln = scene.lights.length;
+    for (const e of scene.emitters) {
+      if (ln >= MAX_LIGHTS) break;
+      this.packEmitterLight(scene.lightData, ln * LIGHT_FLOATS, e);
+      ln++;
+    }
     this.device.queue.writeBuffer(this.primBuffer, 0, scene.primData);
     this.device.queue.writeBuffer(this.lightBuffer, 0, scene.lightData);
     this.primCount = scene.prims.length;
-    this.lightCount = scene.lights.length;
+    this.lightCount = ln; // scene lights + emitter fill-lights
     const sun = scene.lights.find((l) => l.type === LightType.Directional);
     this.sunFlag = sun ? 1 : 0;
     this.sunBright = sun ? sun.intensity : 0;
@@ -561,8 +617,12 @@ export class Renderer {
     d[28] = this.pickX; d[29] = this.pickY; d[30] = this.exposure; d[31] = this.warmth;
     // row 8: sunColor, starsFlag
     d[32] = this.sunColorV.x; d[33] = this.sunColorV.y; d[34] = this.sunColorV.z; d[35] = this.starsFlag;
-    // row 9: aperture, focusDistance, pad, pad (thin-lens depth of field)
-    d[36] = this.aperture; d[37] = this.focusDistance; d[38] = this.giBounces; d[39] = 0;
+    // row 9: aperture, focusDistance, giBounces, shaftStr
+    d[36] = this.aperture; d[37] = this.focusDistance; d[38] = this.giBounces; d[39] = this.shaftStr;
+    // row 10: particleCount, shutter, pad, pad
+    d[40] = this.particleCount; d[41] = this.shutter; d[42] = 0; d[43] = 0;
+    // row 11: particle bounding sphere (cx, cy, cz, radius)
+    d[44] = this.partBound[0]; d[45] = this.partBound[1]; d[46] = this.partBound[2]; d[47] = this.partBound[3];
     this.device.queue.writeBuffer(this.uniformBuffer, 0, d);
   }
 

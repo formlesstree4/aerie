@@ -1,5 +1,5 @@
 import { BufferGeometry, Float32BufferAttribute, Mesh, MeshStandardMaterial, Group, DataTexture, RGBAFormat, SRGBColorSpace, } from "three";
-import { Primitive, Light, MeshInstance } from "./scene";
+import { Primitive, Light, MeshInstance, Emitter } from "./scene";
 import { buildBVH } from "../mesh/bvh";
 import { TRI_STRIDE } from "../mesh/modelImport";
 const SAVE_VERSION = 2;
@@ -44,6 +44,12 @@ export function serializeScene(scene, hooks) {
             bodyRadius: l.bodyRadius, inSky: l.inSky, ringInner: l.ringInner, ringOuter: l.ringOuter,
             ringOpacity: l.ringOpacity, ringTilt: l.ringTilt, ringColor: l.ringColor,
         })),
+        emitters: scene.emitters.map((e) => ({
+            type: e.type, name: e.name, position: v3(e.position),
+            count: e.count, size: e.size, speed: e.speed, spread: e.spread, gravity: e.gravity,
+            lifetime: e.lifetime, intensity: e.intensity, colorA: e.colorA, colorB: e.colorB,
+            seed: e.seed, loop: e.loop, burstTime: e.burstTime,
+        })),
         mesh: {
             texSize: scene.meshTexSize,
             blases: scene.blases.map((b) => f32ToB64(b.tris)),
@@ -77,6 +83,7 @@ export function deserializeScene(scene, json) {
     const clear = (a) => (a.length = 0);
     clear(scene.prims);
     clear(scene.lights);
+    clear(scene.emitters);
     clear(scene.instances);
     clear(scene.blases);
     clear(scene.blasMatBase);
@@ -126,6 +133,24 @@ export function deserializeScene(scene, json) {
         l.ringTilt = sl.ringTilt ?? 0.45;
         l.ringColor = sl.ringColor ?? [0.82, 0.75, 0.6];
         scene.lights.push(l);
+    }
+    for (const se of o.emitters ?? []) {
+        const e = new Emitter(se.type);
+        e.name = se.name ?? e.name;
+        e.position.set(se.position[0], se.position[1], se.position[2]);
+        e.count = se.count;
+        e.size = se.size;
+        e.speed = se.speed;
+        e.spread = se.spread;
+        e.gravity = se.gravity;
+        e.lifetime = se.lifetime;
+        e.intensity = se.intensity;
+        e.colorA = se.colorA;
+        e.colorB = se.colorB;
+        e.seed = se.seed;
+        e.loop = !!se.loop;
+        e.burstTime = se.burstTime ?? 0;
+        scene.emitters.push(e);
     }
     const mesh = o.mesh ?? {};
     scene.meshTexSize = mesh.texSize ?? 256;

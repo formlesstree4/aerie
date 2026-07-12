@@ -1,6 +1,6 @@
 import { Renderer } from "./webgpu/renderer";
 import { OrbitCamera } from "./scene/camera";
-import { defaultScene, Primitive, MeshInstance, Light, LightType, PrimType, PrimPattern, PRIM_LABELS, type SceneState } from "./scene/scene";
+import { defaultScene, Primitive, MeshInstance, Light, Emitter, LightType, PrimType, PrimPattern, PRIM_LABELS, type Selectable, type SceneState } from "./scene/scene";
 import { SCENE_PRESETS, type ScenePreset, type CameraHint } from "./scene/presets";
 import { buildUI, type ScatterOptions, type TurntableOptions } from "./ui";
 import { Preview } from "./preview";
@@ -14,6 +14,7 @@ import { serializeScene, deserializeScene, previewFromBlas, b64ToU8 } from "./sc
 import { buildEditMesh, rebuildBlas, type EditMesh } from "./mesh/editmesh";
 import { History } from "./scene/history";
 import { evalCutscene, cutsceneDuration, keyTime, type CamKey, type Ease, type ObjXform } from "./scene/cutscene";
+import { evaluateEmitter, MAX_PARTICLES, PARTICLE_FLOATS } from "./gen/particles";
 import { Muxer, ArrayBufferTarget } from "webm-muxer";
 import { Vector3, Euler, Matrix3, Matrix4, Quaternion, type Object3D } from "three";
 
@@ -44,10 +45,10 @@ async function main() {
   });
   if (!adapter) fail("No suitable GPU adapter found.");
 
-  // The compute tracer binds 10 storage buffers (8 scene pools + TLAS nodes +
-  // TLAS order); the spec only guarantees 8, so raise the limit to what the
-  // adapter actually supports.
-  const NEEDED_STORAGE_BUFFERS = 10;
+  // The compute tracer binds 11 storage buffers (8 scene pools + TLAS nodes +
+  // TLAS order + the particle field); the spec only guarantees 8, so raise the
+  // limit to what the adapter actually supports.
+  const NEEDED_STORAGE_BUFFERS = 11;
   const maxStorage = adapter.limits.maxStorageBuffersPerShaderStage;
   if (maxStorage < NEEDED_STORAGE_BUFFERS) {
     fail(
@@ -56,7 +57,9 @@ async function main() {
     );
   }
   const device = await adapter.requestDevice({
-    requiredLimits: { maxStorageBuffersPerShaderStage: NEEDED_STORAGE_BUFFERS },
+    // Request the adapter's actual max (≥ what we need) so headroom is available
+    // and adding a buffer later doesn't silently break pipeline creation again.
+    requiredLimits: { maxStorageBuffersPerShaderStage: maxStorage },
   });
   device.lost.then((info) => fail(`GPU device lost: ${info.message}`));
 
@@ -1259,13 +1262,17 @@ async function main() {
     const H = Math.max(16, Math.round(W / aspect));
     const frames = Math.max(1, Math.round(o.seconds * o.fps));
     const startYaw = cam.yaw;
+    const shutter = 1 / o.fps;
     await recordWebM("Turntable", `aerie-turntable-${Date.now()}.webm`, W, H, frames, o.fps, (i) => {
       cam.yaw = startYaw + (i / frames) * Math.PI * 2;
       cam.update();
+      // Animate emitters over the spin so fire/smoke live; motion-blur across 1/fps.
+      if (scene.emitters.length) uploadSceneParticles(i / o.fps, shutter);
       return renderer.renderToPixels(cam, W, H, o.samples);
     });
     cam.yaw = startYaw;
     cam.update();
+    uploadedParticleTime = NaN; // force a re-freeze on the next live frame
   }
 
   // ---- cutscene (camera + DoF keyframe timeline) ----
@@ -1328,6 +1335,9 @@ async function main() {
       csQuat.setFromEuler(m.rotation);
       out.push({ id: m.id, pos: [m.position.x, m.position.y, m.position.z], quat: [csQuat.x, csQuat.y, csQuat.z, csQuat.w], scale: m.scale });
     }
+    for (const e of scene.emitters) {
+      out.push({ id: e.id, pos: [e.position.x, e.position.y, e.position.z], quat: [0, 0, 0, 1], scale: 1 });
+    }
     return out;
   }
 
@@ -1344,9 +1354,10 @@ async function main() {
   }
 
   const objectsById = () => {
-    const m = new Map<number, Primitive | MeshInstance>();
+    const m = new Map<number, Primitive | MeshInstance | Emitter>();
     for (const p of scene.prims) m.set(p.id, p);
     for (const inst of scene.instances) m.set(inst.id, inst);
+    for (const e of scene.emitters) m.set(e.id, e);
     return m;
   };
 
@@ -1354,6 +1365,7 @@ async function main() {
     const xforms: HomeXform[] = [];
     for (const p of scene.prims) xforms.push({ id: p.id, pos: [p.position.x, p.position.y, p.position.z], rot: [p.rotation.x, p.rotation.y, p.rotation.z], scale: 1 });
     for (const m of scene.instances) xforms.push({ id: m.id, pos: [m.position.x, m.position.y, m.position.z], rot: [m.rotation.x, m.rotation.y, m.rotation.z], scale: m.scale });
+    for (const e of scene.emitters) xforms.push({ id: e.id, pos: [e.position.x, e.position.y, e.position.z], rot: [0, 0, 0], scale: 1 });
     cutsceneHome = { xforms, aperture: scene.world.aperture, focusDistance: scene.world.focusDistance, atmo: captureAtmo() };
   }
 
@@ -1365,6 +1377,7 @@ async function main() {
       const obj = byId.get(h.id);
       if (!obj) continue;
       obj.position.set(h.pos[0], h.pos[1], h.pos[2]);
+      if (obj instanceof Emitter) continue; // emitters have no rotation/scale
       obj.rotation.set(h.rot[0], h.rot[1], h.rot[2]);
       if (obj instanceof MeshInstance) obj.scale = h.scale;
     }
@@ -1395,6 +1408,7 @@ async function main() {
         const obj = byId.get(o.id);
         if (!obj) continue;
         obj.position.set(o.pos[0], o.pos[1], o.pos[2]);
+        if (obj instanceof Emitter) continue; // emitters have no rotation/scale
         csQuat.set(o.quat[0], o.quat[1], o.quat[2], o.quat[3]);
         obj.rotation.setFromQuaternion(csQuat);
         if (obj instanceof MeshInstance) obj.scale = o.scale;
@@ -1413,16 +1427,21 @@ async function main() {
     const aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
     const H = Math.max(16, Math.round(W / aspect));
     const frames = Math.max(2, Math.round(total * o.fps));
+    const shutter = 1 / o.fps;
     await recordWebM("Cutscene", `aerie-cutscene-${Date.now()}.webm`, W, H, frames, o.fps, (i) => {
-      applyCutsceneAt((total * i) / (frames - 1));
+      const tSec = (total * i) / (frames - 1);
+      applyCutsceneAt(tSec);
       // The live loop is paused during export, so push the per-frame state into
       // the renderer ourselves: prims (scene), mesh instance matrices, and DoF.
       renderer.uploadScene(scene);
       renderer.uploadInstances(scene);
       renderer.uploadWorld(scene);
+      // Emitters evaluated at this frame's cutscene time, motion-blurred over 1/fps.
+      if (scene.emitters.length) uploadSceneParticles(tSec, shutter);
       return renderer.renderToPixels(cam, W, H, o.samples);
     });
     applyCutsceneAt(cutsceneTime); // return camera + DoF + objects to the playhead
+    uploadedParticleTime = NaN; // force a re-freeze on the next live frame
   }
 
   const cutscene = {
@@ -1590,6 +1609,55 @@ async function main() {
   let uploadedWorld = -1;
   let uploadedPrimTex = -1;
 
+  // ---- particle field (emitters) ----
+  // The stateless model is evaluated on the CPU into this scratch buffer and
+  // uploaded to the tracer. In live Render mode particles are FROZEN at
+  // `particleTime` (0, or the cutscene playhead) so accumulation converges;
+  // scrubbing/exporting re-evaluates at each new time. See gen/particles.ts.
+  const particleData = new Float32Array(MAX_PARTICLES * PARTICLE_FLOATS);
+  let uploadedParticleVersion = -2; // scene.version the particle field was built for
+  let uploadedParticleTime = NaN;   // scene-time the particle field was built for
+
+  /** Evaluate every emitter at time `t` into `particleData`; returns total count. */
+  function evaluateSceneParticles(t: number): number {
+    let count = 0;
+    for (const e of scene.emitters) {
+      if (count >= MAX_PARTICLES) break;
+      count += evaluateEmitter(e, t, particleData, count * PARTICLE_FLOATS);
+    }
+    return count;
+  }
+
+  const particleBound = new Float32Array(4); // cloud bounding sphere for the shader reject
+
+  /** Evaluate all emitters at `t`, compute a bounding sphere over the live
+   *  particles (so the tracer can skip the per-particle loop for rays that miss
+   *  the whole cloud), and upload. `shutter` drives motion blur (1/fps on export). */
+  function uploadSceneParticles(t: number, shutter: number): void {
+    const count = scene.emitters.length > 0 ? evaluateSceneParticles(t) : 0;
+    let minX = 1e30, minY = 1e30, minZ = 1e30, maxX = -1e30, maxY = -1e30, maxZ = -1e30, maxR = 0;
+    for (let i = 0; i < count; i++) {
+      const o = i * PARTICLE_FLOATS;
+      if (particleData[o + 7] <= 0.003) continue; // dead slot
+      const x = particleData[o], y = particleData[o + 1], z = particleData[o + 2];
+      minX = Math.min(minX, x); minY = Math.min(minY, y); minZ = Math.min(minZ, z);
+      maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); maxZ = Math.max(maxZ, z);
+      maxR = Math.max(maxR, particleData[o + 3]);
+    }
+    if (count > 0 && maxX >= minX) {
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+      particleBound[0] = cx; particleBound[1] = cy; particleBound[2] = cz;
+      particleBound[3] = Math.hypot(maxX - cx, maxY - cy, maxZ - cz) + maxR + 0.5;
+    } else {
+      particleBound.fill(0);
+    }
+    renderer.uploadParticles(particleData, count, shutter, particleBound);
+  }
+
+  /** The frozen scene-time particles are shown at in live Render mode: the
+   *  cutscene playhead while the cutscene is open, otherwise a still t=0. */
+  const liveParticleTime = (): number => (cutsceneMode ? cutsceneTime : 0);
+
   // ---- sizing (cap DPR so the path tracer stays interactive) ----
   const MAX_SAMPLES = 512;
   function resize() {
@@ -1615,12 +1683,12 @@ async function main() {
   let drag: Drag = "none";
   let lastX = 0;
   let lastY = 0;
-  let dragTarget: Primitive | MeshInstance | Light | null = null;
+  let dragTarget: Primitive | MeshInstance | Light | Emitter | null = null;
   // Box-select rectangle (CSS px, same space as projectToScreen).
   let marqStartX = 0, marqStartY = 0, marqCurX = 0, marqCurY = 0;
   // Group transform: snapshot of each selected object's full transform at drag
   // start, so rotate/scale can orbit/scale the whole selection about its pivot.
-  type Movable = Primitive | MeshInstance | Light;
+  type Movable = Primitive | MeshInstance | Light | Emitter;
   interface TSnap { pos: Vector3; rot: Euler | null; dir: Vector3 | null; scale: number; a: number; b: number; c: number; }
   const xformSnap = new Map<Movable, TSnap>();
   const objDragHit0 = new Vector3();
@@ -1667,7 +1735,7 @@ async function main() {
   function snapOf(it: Movable): TSnap {
     return {
       pos: it.position.clone(),
-      rot: it instanceof Light ? null : it.rotation.clone(),
+      rot: (it instanceof Light || it instanceof Emitter) ? null : it.rotation.clone(),
       dir: it instanceof Light ? it.direction.clone() : null,
       scale: it instanceof MeshInstance ? it.scale : 1,
       a: it instanceof Primitive ? it.a : 0,
@@ -1712,7 +1780,7 @@ async function main() {
     rotQ.setFromAxisAngle(WORLD_AXES[activeAxisIdx], angle);
     for (const [it, s] of xformSnap) {
       it.position.copy(s.pos).sub(gizmoPivot).applyQuaternion(rotQ).add(gizmoPivot);
-      if (s.rot && !(it instanceof Light)) { tmpQ.setFromEuler(s.rot).premultiply(rotQ); it.rotation.setFromQuaternion(tmpQ); }
+      if (s.rot && !(it instanceof Light) && !(it instanceof Emitter)) { tmpQ.setFromEuler(s.rot).premultiply(rotQ); it.rotation.setFromQuaternion(tmpQ); }
       if (s.dir && it instanceof Light) it.direction.copy(s.dir).applyQuaternion(rotQ);
     }
     touchAfterXform();
@@ -1731,7 +1799,8 @@ async function main() {
   // light keeps its dedicated handle re-aim (drag the sun marker) instead.
   function gizmoActive(): boolean {
     return ui.getSelection().some(
-      (it) => it instanceof Primitive || it instanceof MeshInstance || (it instanceof Light && it.type === LightType.Point),
+      (it) => it instanceof Primitive || it instanceof MeshInstance || it instanceof Emitter ||
+        (it instanceof Light && it.type === LightType.Point),
     );
   }
   // Pivot of the current selection (average of gizmo centres) and a handle radius.
@@ -1774,6 +1843,7 @@ async function main() {
     for (const p of scene.prims) if (inMarquee(p.position, x0, y0, x1, y1)) hits.push(p);
     for (const m of scene.instances) if (inMarquee(m.position, x0, y0, x1, y1)) hits.push(m);
     for (const l of scene.lights) if (inMarquee(lightGizmoPos(l, tmpV), x0, y0, x1, y1)) hits.push(l);
+    for (const em of scene.emitters) if (inMarquee(tmpV.copy(em.position), x0, y0, x1, y1)) hits.push(em);
     if (additive) {
       const cur = ui.getSelection();
       for (const h of hits) if (!cur.includes(h)) cur.push(h);
@@ -1797,6 +1867,8 @@ async function main() {
   function clickSelectObject(e: PointerEvent, additive: boolean): void {
     const light = pickLight(e.clientX, e.clientY);
     if (light) { applyClickSelection(light, additive); return; }
+    const emitter = pickEmitter(e.clientX, e.clientY);
+    if (emitter) { applyClickSelection(emitter, additive); return; }
     const dpr = renderer.width / Math.max(1, canvas.clientWidth);
     renderer.pick(cam, e.clientX * dpr, e.clientY * dpr).then((r) => {
       let target: Movable | null = null;
@@ -1898,11 +1970,18 @@ async function main() {
       }
 
       // --- Move tool: click-select + drag-move ---
-      // Lights aren't in the GPU pick buffer — test their viewport handles first.
+      // Lights and emitters aren't in the GPU pick buffer — test their viewport
+      // handles first (nearest handle wins if they overlap).
       const light = pickLight(e.clientX, e.clientY);
-      if (light) {
-        ui.select(light);
-        startLightDrag(light, e);
+      const emitter = pickEmitter(e.clientX, e.clientY);
+      if (light || emitter) {
+        // Prefer whichever handle is closer to the cursor.
+        const lp = light ? projectToScreen(lightGizmoPos(light, tmpV)) : null;
+        const ep = emitter ? projectToScreen(tmpV.copy(emitter.position)) : null;
+        const ld = lp ? Math.hypot(e.clientX - lp.x, e.clientY - lp.y) : Infinity;
+        const ed = ep ? Math.hypot(e.clientX - ep.x, e.clientY - ep.y) : Infinity;
+        if (emitter && ed <= ld) { ui.select(emitter); startEmitterDrag(emitter, e); }
+        else { ui.select(light!); startLightDrag(light!, e); }
         return;
       }
 
@@ -2093,7 +2172,7 @@ async function main() {
       const r = Math.sqrt(Math.random()) * radius; // sqrt → even areal spread
       it.position.x += Math.cos(ang) * r;
       it.position.z += Math.sin(ang) * r;
-      if (!(it instanceof Light)) it.rotation.y += (Math.random() - 0.5) * Math.PI;
+      if (!(it instanceof Light) && !(it instanceof Emitter)) it.rotation.y += (Math.random() - 0.5) * Math.PI;
     }
     afterArrange(sel);
   }
@@ -2111,7 +2190,8 @@ async function main() {
       it.position.setComponent(axis, 2 * pivot.getComponent(axis) - it.position.getComponent(axis));
       if (it instanceof Light) {
         if (it.type === LightType.Directional) it.direction.setComponent(axis, -it.direction.getComponent(axis));
-      } else {
+      } else if (!(it instanceof Emitter)) {
+        // Emitters are radially symmetric — reflect position only, no rotation.
         m.makeRotationFromEuler(it.rotation).premultiply(s).multiply(s);
         it.rotation.setFromRotationMatrix(m);
       }
@@ -2266,8 +2346,9 @@ async function main() {
     return out.copy(l.position);
   }
 
-  function gizmoFrame(sel: Primitive | MeshInstance | Light): { center: Vector3; radius: number } {
+  function gizmoFrame(sel: Selectable): { center: Vector3; radius: number } {
     if (sel instanceof Light) return { center: lightGizmoPos(sel), radius: 7 };
+    if (sel instanceof Emitter) return { center: new Vector3().copy(sel.position), radius: Math.max(2, sel.size * 3) };
     const radius = sel instanceof Primitive ? Math.max(sel.a, sel.b, sel.c) + 1.5 : 12 * sel.scale;
     return { center: new Vector3().copy(sel.position), radius };
   }
@@ -2305,6 +2386,36 @@ async function main() {
     const hit = rayPlane(ray.ro, ray.rd, planePoint, planeNormal);
     if (hit) objDragHit0.copy(hit);
     beginGroupSnapshot(l);
+    drag = "object";
+  }
+
+  /** Nearest emitter whose viewport handle is under the cursor, or null.
+   *  Emitters aren't ray-traced geometry, so — like lights — they can't be GPU-
+   *  picked; a small handle at the emitter origin is the click target. */
+  function pickEmitter(cx: number, cy: number): Emitter | null {
+    let best: Emitter | null = null;
+    let bestD = 14; // px hit radius
+    for (const em of scene.emitters) {
+      const s = projectToScreen(tmpV.copy(em.position));
+      if (!s) continue;
+      const d = Math.hypot(cx - s.x, cy - s.y);
+      if (d < bestD) { bestD = d; best = em; }
+    }
+    return best;
+  }
+
+  /** Begin dragging an emitter on the ground plane (Shift = vertical). */
+  function startEmitterDrag(em: Emitter, e: PointerEvent): void {
+    dragTarget = em;
+    draggingDirLight = false;
+    dragVertical = e.shiftKey;
+    planePoint.copy(em.position);
+    if (dragVertical) planeNormal.copy(cam.forward).setY(0).normalize();
+    else planeNormal.set(0, 1, 0);
+    const ray = screenRay(e.clientX, e.clientY);
+    const hit = rayPlane(ray.ro, ray.rd, planePoint, planeNormal);
+    if (hit) objDragHit0.copy(hit);
+    beginGroupSnapshot(em);
     drag = "object";
   }
 
@@ -2412,6 +2523,28 @@ async function main() {
     }
   }
 
+  // Draw a clickable diamond handle at every emitter origin (they have no
+  // ray-traced geometry to click, like lights). Selected ones get extra chrome.
+  function drawEmitterMarkers() {
+    const selSet = ui.getSelection();
+    for (const em of scene.emitters) {
+      const s = projectToScreen(lightTmp.copy(em.position));
+      if (!s) continue;
+      const on = selSet.includes(em);
+      const r = on ? 6 : 5;
+      octx.save();
+      octx.strokeStyle = octx.fillStyle = on ? "#ffd08a" : "rgba(255,180,110,0.85)";
+      octx.lineWidth = on ? 2 : 1.5;
+      octx.beginPath();
+      octx.moveTo(s.x, s.y - r); octx.lineTo(s.x + r, s.y);
+      octx.lineTo(s.x, s.y + r); octx.lineTo(s.x - r, s.y);
+      octx.closePath();
+      octx.stroke();
+      octx.beginPath(); octx.arc(s.x, s.y, 1.6, 0, Math.PI * 2); octx.fill();
+      octx.restore();
+    }
+  }
+
   // Oriented half-extents of a primitive's bounding cage (matches the SDF dims).
   const ghostQuat = new Quaternion();
   const ghostCorner = new Vector3();
@@ -2508,6 +2641,7 @@ async function main() {
     if (poseInst) { drawPose(); return; }
     drawCarverGhosts();
     drawLightMarkers();
+    drawEmitterMarkers();
     drawSelectionBoxes(); // dashed outline on every selected primitive/instance
     // One manipulator at the selection pivot, in the active transform mode.
     if (gizmoActive()) {
@@ -2771,6 +2905,16 @@ async function main() {
     if (scene.primTexVersion !== uploadedPrimTex) {
       renderer.uploadPrimTextures(scene);
       uploadedPrimTex = scene.primTexVersion;
+    }
+    // Particle field: re-evaluate + upload only when the emitters changed or the
+    // frozen scene-time moved (scrub/play), so a still render still accumulates.
+    {
+      const pt = liveParticleTime();
+      if (scene.version !== uploadedParticleVersion || pt !== uploadedParticleTime) {
+        uploadSceneParticles(pt, 0);
+        uploadedParticleVersion = scene.version;
+        uploadedParticleTime = pt;
+      }
     }
     if (applyCameraKeys(dt)) renderer.resetAccumulation();
     cam.update();

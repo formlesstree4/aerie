@@ -1,5 +1,6 @@
 import { Vector3, Euler, Quaternion, Matrix4 } from "three";
 import { TERRAIN_CATALOG, BASIS_ID, FRACTAL_ID, type TerrainKind, type LandformSpec } from "../gen/recipe";
+import { EmitterType, EMITTER_LABELS, defaultEmitter, type EmitterSpec } from "../gen/particles";
 
 // Keep these in sync with the WGSL structs in raytrace.wgsl.
 export const MAX_PRIMS = 64;
@@ -236,7 +237,50 @@ export class Light {
   }
 }
 
-export type Selectable = Primitive | Light | MeshInstance;
+/** A particle emitter (campfire, explosion, …). Holds the tunable spec; the
+ *  actual particle field is a stateless function of time — see gen/particles.ts.
+ *  Position is a Vector3 so it drags/animates like any other object; the rest of
+ *  the EmitterSpec fields live flat on the instance and satisfy that interface. */
+export class Emitter implements EmitterSpec {
+  readonly id = nextId++;
+  name: string;
+  position = new Vector3();
+  count: number;
+  size: number;
+  speed: number;
+  spread: number;
+  gravity: number;
+  lifetime: number;
+  intensity: number;
+  colorA: [number, number, number];
+  colorB: [number, number, number];
+  seed: number;
+  loop: boolean;
+  burstTime: number;
+
+  constructor(public type: EmitterType) {
+    const d = defaultEmitter(type);
+    this.name = `${EMITTER_LABELS[type]} ${this.id}`;
+    this.count = d.count; this.size = d.size; this.speed = d.speed; this.spread = d.spread;
+    this.gravity = d.gravity; this.lifetime = d.lifetime; this.intensity = d.intensity;
+    this.colorA = [...d.colorA]; this.colorB = [...d.colorB];
+    this.seed = d.seed; this.loop = d.loop; this.burstTime = d.burstTime;
+  }
+
+  clone(): Emitter {
+    const e = new Emitter(this.type);
+    (e as { id: number }).id = this.id;
+    e.name = this.name;
+    e.position.copy(this.position);
+    e.count = this.count; e.size = this.size; e.speed = this.speed; e.spread = this.spread;
+    e.gravity = this.gravity; e.lifetime = this.lifetime; e.intensity = this.intensity;
+    e.colorA = [...this.colorA]; e.colorB = [...this.colorB];
+    e.seed = this.seed; e.loop = this.loop; e.burstTime = this.burstTime;
+    return e;
+  }
+}
+
+export type Selectable = Primitive | Light | MeshInstance | Emitter;
 
 // ---- clouds: stacked 2D layers, each a named meteorological type ----
 export const MAX_CLOUD_LAYERS = 4;
@@ -331,6 +375,7 @@ export interface World {
   exposure: number;
   warmth: number;
   giBounces: number;      // indirect diffuse bounces (0 = fast direct-only/legacy look)
+  shaftStrength: number;  // volumetric god-ray (crepuscular shaft) strength; 0 = off
   aperture: number;       // thin-lens radius (world units); 0 = pinhole (DoF off)
   focusDistance: number;  // distance to the sharp focal plane (world units)
   timeOfDay: number;      // 0..24 hours; drives the sun arc + sky tint (applyTimeOfDay)
@@ -384,7 +429,8 @@ export function defaultWorld(): World {
     waterReflectivity: 0.02,
     exposure: 1.05,
     warmth: 0.5,
-    giBounces: 2,
+    giBounces: 1,
+    shaftStrength: 0,
     aperture: 0,
     focusDistance: 60,
     timeOfDay: 12,
@@ -497,6 +543,7 @@ export class MeshInstance {
 export interface SceneState {
   prims: Primitive[];
   lights: Light[];
+  emitters: Emitter[];
   instances: MeshInstance[];
   world: World;
   blases: BLAS[];
@@ -515,6 +562,7 @@ export interface SceneState {
 export class Scene {
   readonly prims: Primitive[] = [];
   readonly lights: Light[] = [];
+  readonly emitters: Emitter[] = [];
   /** Bumped on any structural or property change; the renderer watches it. */
   version = 0;
 
@@ -916,10 +964,21 @@ export class Scene {
     return l;
   }
 
+  addEmitter(type: EmitterType, at?: Vector3): Emitter {
+    const e = new Emitter(type);
+    if (at) e.position.copy(at);
+    this.emitters.push(e);
+    this.touch();
+    return e;
+  }
+
   remove(item: Selectable): void {
     if (item instanceof Primitive) {
       const i = this.prims.indexOf(item);
       if (i >= 0) this.prims.splice(i, 1);
+    } else if (item instanceof Emitter) {
+      const i = this.emitters.indexOf(item);
+      if (i >= 0) this.emitters.splice(i, 1);
     } else if (item instanceof MeshInstance) {
       const i = this.instances.indexOf(item);
       if (i >= 0) {
@@ -935,7 +994,7 @@ export class Scene {
 
   /** Every pickable/movable item, in list order. */
   get selectables(): Selectable[] {
-    return [...this.prims, ...this.instances, ...this.lights];
+    return [...this.prims, ...this.instances, ...this.lights, ...this.emitters];
   }
 
   /** Append an independent copy of an item (fresh id; mesh copies share geometry). */
@@ -947,6 +1006,10 @@ export class Scene {
     if (item instanceof Light) {
       const l = item.clone(); (l as { id: number }).id = nextId++;
       this.lights.push(l); this.touch(); return l;
+    }
+    if (item instanceof Emitter) {
+      const e = item.clone(); (e as { id: number }).id = nextId++;
+      this.emitters.push(e); this.touch(); return e;
     }
     const m = item.clone(); (m as { id: number }).id = nextId++;
     this.instances.push(m); this.touchInstances(); return m;
@@ -962,6 +1025,7 @@ export class Scene {
     return {
       prims: this.prims.map((p) => p.clone()),
       lights: this.lights.map((l) => l.clone()),
+      emitters: this.emitters.map((e) => e.clone()),
       instances: this.instances.map((m) => m.clone()),
       world: structuredClone(this.world),
       blases: this.blases.slice(),
@@ -983,6 +1047,7 @@ export class Scene {
     const replace = <T>(arr: T[], items: T[]): void => { arr.length = 0; arr.push(...items); };
     replace(this.prims, s.prims.map((p) => p.clone()));
     replace(this.lights, s.lights.map((l) => l.clone()));
+    replace(this.emitters, s.emitters.map((e) => e.clone()));
     replace(this.instances, s.instances.map((m) => m.clone()));
     Object.assign(this.world, structuredClone(s.world));
     replace(this.blases, s.blases.slice());
