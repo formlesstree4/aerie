@@ -11,6 +11,10 @@ import {
   Fog,
   AnimationMixer,
   AnimationClip,
+  AnimationUtils,
+  AdditiveAnimationBlendMode,
+  NormalAnimationBlendMode,
+  type AnimationAction,
   Clock,
   Group,
   Object3D,
@@ -26,6 +30,8 @@ import {
 } from "three";
 import type { OrbitCamera } from "./scene/camera";
 import { Scene as AppScene, LightType, type BLAS } from "./scene/scene";
+import type { BonePose } from "./scene/cutscene";
+import { makeSpringBone, stepSpringBone, resetSpringBone, DEFAULT_SPRING, type SpringBoneState, type SpringParams } from "./mesh/spring";
 import { previewFromBlas } from "./scene/serialize";
 import { worldTerrainHeight, worldTerrainColor } from "./gen/terrainField";
 import { primitiveLocalGeometry } from "./mesh/tessellate";
@@ -43,9 +49,27 @@ export class Preview {
   private sun = new DirectionalLight(0xfff3e0, 3);
   private instances = new Map<
     number,
-    { group: Group; inner: Object3D; mixer: AnimationMixer | null; blas: BLAS | null }
+    {
+      group: Group; inner: Object3D; mixer: AnimationMixer | null; blas: BLAS | null;
+      // Clip mixer: each imported clip has a lazily-created action, a blend weight,
+      // and a normal/additive mode, so several can play at once and blend (Phase 8).
+      // `clipIndex` is the "primary" clip for the scrub/snapshot workflow (Phase 5).
+      animations: AnimationClip[];
+      actions: (AnimationAction | null)[];
+      weights: number[];
+      additive: boolean[];
+      additiveClips: (AnimationClip | null)[];
+      clipIndex: number;
+    }
   >();
   private posing = new Set<number>(); // instances whose animation is paused for manual posing
+  // Cutscene-driven skeleton poses. Applied after the mixer each frame so keyed
+  // joint animation wins over any imported clip; bones cached to skip traversal.
+  private poseOverride = new Map<number, { bones: Object3D[]; pose: BonePose[] }>();
+  // Spring-bone dynamics per instance (bone index → sim state) + per-instance params.
+  // Stepped after the pose is set, so secondary motion layers on the base pose.
+  private springs = new Map<number, Map<number, SpringBoneState>>();
+  private springParamsById = new Map<number, SpringParams>();
   private clock = new Clock();
   // Procedural world surfaces mirrored from the ray tracer so placement in the
   // preview matches the final render. Built lazily / on worldVersion change.
@@ -87,13 +111,162 @@ export class Preview {
 
   addInstance(id: number, group: Group, animations: AnimationClip[], blas?: BLAS | null): void {
     const mixer = animations.length ? new AnimationMixer(group) : null;
-    mixer?.clipAction(animations[0]).play();
+    const actions: (AnimationAction | null)[] = animations.map(() => null);
+    const weights = animations.map((_, i) => (i === 0 ? 1 : 0)); // clip 0 solo by default
+    const additive = animations.map(() => false);
+    const additiveClips: (AnimationClip | null)[] = animations.map(() => null);
+    if (mixer && animations.length) { const a = mixer.clipAction(animations[0]); a.play(); a.setEffectiveWeight(1); actions[0] = a; }
     this.scene.add(group);
     // Remember the geometry this group was built from, so syncInstances can
     // detect when an undo/redo (or edit/bake) swapped the BLAS and rebuild.
     const inst = this.app.instances.find((i) => i.id === id);
     const resolvedBlas = blas !== undefined ? blas : inst ? this.app.blases[inst.blasIndex] ?? null : null;
-    this.instances.set(id, { group, inner: group.children[0], mixer, blas: resolvedBlas });
+    this.instances.set(id, { group, inner: group.children[0], mixer, blas: resolvedBlas, animations, actions, weights, additive, additiveClips, clipIndex: 0 });
+  }
+
+  // ---- clip mixer (Phase 5 scrub/snapshot + Phase 8 weighted blending) ----
+  private clipEntry = (id: number) => this.instances.get(id);
+
+  /** Additive version of a clip (cached) — its motion is applied relative to the
+   *  first frame, so it layers on top of whatever else is playing. */
+  private additiveClip(e: NonNullable<ReturnType<Preview["clipEntry"]>>, i: number): AnimationClip {
+    let c = e.additiveClips[i];
+    if (!c) { c = e.animations[i].clone(); AnimationUtils.makeClipAdditive(c); e.additiveClips[i] = c; }
+    return c;
+  }
+
+  /** The action for clip `i`, created (playing, at its stored weight/mode) if needed. */
+  private ensureAction(e: NonNullable<ReturnType<Preview["clipEntry"]>>, i: number): AnimationAction | null {
+    if (!e.mixer) return null;
+    let a = e.actions[i];
+    if (!a) {
+      a = e.mixer.clipAction(e.additive[i] ? this.additiveClip(e, i) : e.animations[i]);
+      a.blendMode = e.additive[i] ? AdditiveAnimationBlendMode : NormalAnimationBlendMode;
+      a.play();
+      a.enabled = e.weights[i] > 0;
+      a.setEffectiveWeight(e.weights[i]);
+      e.actions[i] = a;
+    }
+    return a;
+  }
+
+  /** Append imported animation clips to a rig's clip list (creating the mixer if
+   *  the model had none). Clips bind to bones by name, so they drive the rig when
+   *  the animation's skeleton matches this model's. Returns how many were added. */
+  addClips(id: number, clips: AnimationClip[]): number {
+    const e = this.clipEntry(id);
+    if (!e || clips.length === 0) return 0;
+    if (!e.mixer) e.mixer = new AnimationMixer(e.group);
+    for (const c of clips) {
+      e.animations.push(c);
+      e.actions.push(null);
+      e.weights.push(0);
+      e.additive.push(false);
+      e.additiveClips.push(null);
+    }
+    return clips.length;
+  }
+
+  /** Names of an instance's imported animation clips. */
+  clipNames(id: number): string[] {
+    return this.clipEntry(id)?.animations.map((a, i) => a.name || `clip ${i + 1}`) ?? [];
+  }
+
+  activeClipIndex(id: number): number {
+    return this.clipEntry(id)?.clipIndex ?? -1;
+  }
+
+  activeClipDuration(id: number): number {
+    const e = this.clipEntry(id);
+    return e?.animations[e.clipIndex]?.duration ?? 0;
+  }
+
+  /** Current scrub time of the primary clip (seconds). */
+  clipTime(id: number): number {
+    const e = this.clipEntry(id);
+    return e?.actions[e.clipIndex]?.time ?? 0;
+  }
+
+  /** Blend weight of clip `i` (0 = off, 1 = full). */
+  clipWeight(id: number, i: number): number {
+    return this.clipEntry(id)?.weights[i] ?? 0;
+  }
+
+  /** Whether clip `i` layers additively over the others. */
+  clipAdditive(id: number, i: number): boolean {
+    return this.clipEntry(id)?.additive[i] ?? false;
+  }
+
+  /** Set clip `i`'s blend weight; the mixer normalises simultaneous normal-mode
+   *  clips and layers additive ones. Playing clips animate when not posing. */
+  setClipWeight(id: number, i: number, w: number): void {
+    const e = this.clipEntry(id);
+    if (!e || !e.mixer || i < 0 || i >= e.animations.length) return;
+    e.weights[i] = Math.max(0, Math.min(1, w));
+    const a = this.ensureAction(e, i);
+    if (a) { a.enabled = e.weights[i] > 0; a.setEffectiveWeight(e.weights[i]); if (e.weights[i] > 0 && !a.isRunning()) a.play(); }
+  }
+
+  /** Toggle clip `i` between normal and additive blending (rebuilds its action). */
+  setClipAdditive(id: number, i: number, on: boolean): void {
+    const e = this.clipEntry(id);
+    if (!e || !e.mixer || e.additive[i] === on) return;
+    e.additive[i] = on;
+    e.actions[i]?.stop();
+    e.actions[i] = null;
+    this.ensureAction(e, i); // recreated with the new blend mode + current weight
+  }
+
+  /** Crossfade the primary clip to clip `to` over `seconds`, updating weights. */
+  crossFade(id: number, to: number, seconds: number): void {
+    const e = this.clipEntry(id);
+    if (!e || !e.mixer || to < 0 || to >= e.animations.length) return;
+    const from = e.clipIndex;
+    if (from === to) return;
+    const fa = this.ensureAction(e, from);
+    const ta = this.ensureAction(e, to);
+    if (!fa || !ta) return;
+    ta.enabled = true; ta.setEffectiveWeight(1); ta.play();
+    fa.crossFadeTo(ta, Math.max(0.01, seconds), false);
+    e.weights[from] = 0; e.weights[to] = 1; // end-state bookkeeping for the UI
+    e.clipIndex = to;
+  }
+
+  /** Switch the primary clip and solo it (weight 1, others 0). While posing,
+   *  sample its first frame so the rig shows it without the mixer advancing. */
+  setActiveClip(id: number, index: number): void {
+    const e = this.clipEntry(id);
+    if (!e || !e.mixer || index < 0 || index >= e.animations.length) return;
+    e.clipIndex = index;
+    for (let j = 0; j < e.animations.length; j++) {
+      e.weights[j] = j === index ? 1 : 0;
+      const a = this.ensureAction(e, j);
+      if (a) { a.enabled = e.weights[j] > 0; a.setEffectiveWeight(e.weights[j]); }
+    }
+    const pa = e.actions[index];
+    if (pa) { pa.reset(); pa.play(); }
+    if (this.posing.has(id) && pa) { pa.paused = true; pa.time = 0; e.mixer.update(0); }
+  }
+
+  /** Sample the primary clip at `time` onto the skeleton (scrub to a frame). */
+  scrubClip(id: number, time: number): void {
+    const e = this.clipEntry(id);
+    if (!e || !e.mixer) return;
+    const a = e.actions[e.clipIndex];
+    if (!a) return;
+    a.paused = true;
+    a.time = Math.max(0, Math.min(time, e.animations[e.clipIndex]?.duration ?? 0));
+    e.mixer.update(0); // apply the sampled pose now
+  }
+
+  /** Commit the current pose as the rig's working pose by stopping every clip, so
+   *  the mixer no longer drives the bones. */
+  snapshotClipPose(id: number): void {
+    const e = this.clipEntry(id);
+    if (!e) return;
+    for (const a of e.actions) a?.stop();
+    e.actions = e.animations.map(() => null);
+    e.weights = e.animations.map(() => 0);
   }
 
   /** Skeleton bones of an instance (for posing), or null if it isn't rigged. */
@@ -106,6 +279,79 @@ export class Preview {
       if (sk.isSkinnedMesh && sk.skeleton && !bones) bones = sk.skeleton.bones;
     });
     return bones;
+  }
+
+  /**
+   * Total skin weight each bone carries, across every skinned mesh of the
+   * instance (indexed like `getBones`).
+   *
+   * Dense character rigs carry hundreds of bones that deform nothing you can
+   * see — twist and roll helpers, cloth and jiggle chains, correctives, IK
+   * targets, attachment points. Dragging one moves the skeleton overlay and
+   * leaves the model sitting there, which is indistinguishable from "posing is
+   * broken". This is how the poser tells the two apart.
+   */
+  boneInfluence(id: number): Float32Array | null {
+    const e = this.instances.get(id);
+    const bones = this.getBones(id);
+    if (!e || !bones) return null;
+    const out = new Float32Array(bones.length);
+    const index = new Map<Object3D, number>(bones.map((b, i) => [b, i]));
+    e.inner.traverse((o) => {
+      const sk = o as unknown as {
+        isSkinnedMesh?: boolean; skeleton?: { bones: Object3D[] };
+        geometry?: { attributes: Record<string, { count: number; getComponent(i: number, k: number): number } | undefined> };
+      };
+      if (!sk.isSkinnedMesh || !sk.skeleton || !sk.geometry) return;
+      const si = sk.geometry.attributes.skinIndex;
+      const sw = sk.geometry.attributes.skinWeight;
+      if (!si || !sw) return;
+      const meshBones = sk.skeleton.bones;
+      for (let v = 0; v < si.count; v++) {
+        for (let k = 0; k < 4; k++) {
+          const w = sw.getComponent(v, k);
+          if (w <= 0) continue;
+          const gi = index.get(meshBones[si.getComponent(v, k)]);
+          if (gi !== undefined) out[gi] += w;
+        }
+      }
+    });
+    return out;
+  }
+
+  /** What the rig looks like to the poser — skinned meshes, whether they share a
+   *  skeleton, and how many of its bones actually deform geometry. Logged when
+   *  posing starts, so "I dragged a joint and nothing moved" is answerable. */
+  rigReport(id: number): string {
+    const e = this.instances.get(id);
+    if (!e) return "no preview instance";
+    const meshes: { name: string; bones: number; skel: object; verts: number; visible: boolean }[] = [];
+    e.inner.traverse((o) => {
+      const sk = o as unknown as {
+        isSkinnedMesh?: boolean; skeleton?: { bones: Object3D[] }; name: string; visible: boolean;
+        geometry?: { attributes?: { position?: { count: number } } };
+      };
+      if (sk.isSkinnedMesh && sk.skeleton) {
+        meshes.push({
+          name: sk.name || "(unnamed)", bones: sk.skeleton.bones.length, skel: sk.skeleton,
+          verts: sk.geometry?.attributes?.position?.count ?? 0, visible: sk.visible,
+        });
+      }
+    });
+    const skeletons = new Set(meshes.map((m) => m.skel));
+    const posed = this.getBones(id);
+    const drivenBy = (m: (typeof meshes)[number]) =>
+      posed && (m.skel as { bones: Object3D[] }).bones.some((b) => posed.includes(b));
+    const inf = this.boneInfluence(id);
+    const deforming = inf ? inf.reduce((n, w) => n + (w >= 1 ? 1 : 0), 0) : -1;
+    return [
+      `skinned meshes: ${meshes.length} · distinct skeletons: ${skeletons.size}`,
+      `posed skeleton: ${posed ? `${posed.length} bones` : "none"}` +
+        (deforming >= 0 ? ` · ${deforming} carry skin weight, ${(posed?.length ?? 0) - deforming} are helpers` : ""),
+      ...meshes.map((m, i) =>
+        `  [${i}] ${m.name} — ${m.bones} bones, ${m.verts} verts` +
+        `${m.visible ? "" : ", HIDDEN"}${drivenBy(m) ? "  ← follows the posed bones" : "  ← NOT driven by the posed bones"}`),
+    ].join("\n");
   }
 
   /** The instance's transformed scene-graph root (for world-geometry extraction). */
@@ -123,6 +369,60 @@ export class Preview {
     return this.posing.has(id);
   }
 
+  /** Drive an instance's skeleton from a cutscene keyframe pose (null clears it).
+   *  Applied every frame after the mixer, so it overrides clip playback. */
+  setPoseOverride(id: number, pose: BonePose[] | null): void {
+    if (!pose) { this.poseOverride.delete(id); return; }
+    const bones = this.getBones(id);
+    if (bones) this.poseOverride.set(id, { bones, pose });
+  }
+
+  clearPoseOverrides(): void {
+    this.poseOverride.clear();
+  }
+
+  // ---- spring bones (Phase 9: secondary motion) ----
+  /** Mark/unmark bone `i` as a spring. Springs need a child bone to aim at, so
+   *  leaf joints are ignored. Disabling restores the bone to its rest pose. */
+  setSpringBone(id: number, i: number, on: boolean): void {
+    let m = this.springs.get(id);
+    if (!on) {
+      const s = m?.get(i);
+      if (s) { resetSpringBone(s); m!.delete(i); }
+      return;
+    }
+    const bones = this.getBones(id);
+    const bone = bones?.[i];
+    if (!bones || !bone) return;
+    const child = bones.find((x) => x.parent === bone); // first child bone → the aim target
+    if (!child) return; // leaf: nothing to swing
+    if (!m) { m = new Map(); this.springs.set(id, m); }
+    if (!m.has(i)) m.set(i, makeSpringBone(bone, child.position.clone()));
+  }
+
+  isSpringBone(id: number, i: number): boolean {
+    return this.springs.get(id)?.has(i) ?? false;
+  }
+
+  hasSprings(id: number): boolean {
+    return (this.springs.get(id)?.size ?? 0) > 0;
+  }
+
+  springParams(id: number): SpringParams {
+    return this.springParamsById.get(id) ?? { ...DEFAULT_SPRING };
+  }
+
+  setSpringParam(id: number, key: keyof SpringParams, v: number): void {
+    const p = { ...this.springParams(id), [key]: v };
+    this.springParamsById.set(id, p);
+  }
+
+  clearSprings(id: number): void {
+    const m = this.springs.get(id);
+    if (m) for (const s of m.values()) resetSpringBone(s);
+    this.springs.delete(id);
+  }
+
   /** Put an instance's geometry in LOCAL space (instance transform removed) and
    *  return its root, so the current animation pose can be re-baked. */
   prepareBake(id: number): Object3D | null {
@@ -135,12 +435,64 @@ export class Preview {
     return e.inner;
   }
 
+  /** Like `prepareBake`, but first stamps a cutscene keyframe pose onto the
+   *  skeleton — used to re-bake each frame of an offline render so the ray tracer
+   *  sees the posed joints (it draws from the BLAS, not the live skeleton). */
+  prepareBakePosed(id: number, pose: BonePose[]): Object3D | null {
+    const bones = this.getBones(id);
+    if (bones) {
+      for (const bp of pose) {
+        const b = bones[bp.i];
+        if (b) b.quaternion.set(bp.q[0], bp.q[1], bp.q[2], bp.q[3]);
+      }
+    }
+    return this.prepareBake(id); // zeroes the group + refreshes world matrices
+  }
+
+  /** Offline-render prep with spring dynamics. Stamps the keyframe pose, places
+   *  the instance at its world transform so the springs feel it moving through the
+   *  shot, steps the sim by `dt`, then hands back the local-space root to bake.
+   *  `place` is the instance's world transform (quaternion as xyzw). */
+  prepareBakePosedDynamic(
+    id: number,
+    pose: BonePose[] | null,
+    place: { px: number; py: number; pz: number; qx: number; qy: number; qz: number; qw: number; scale: number },
+    dt: number,
+  ): Object3D | null {
+    const e = this.instances.get(id);
+    if (!e) return null;
+    const bones = this.getBones(id);
+    if (bones && pose) {
+      for (const bp of pose) { const b = bones[bp.i]; if (b) b.quaternion.set(bp.q[0], bp.q[1], bp.q[2], bp.q[3]); }
+    }
+    const m = this.springs.get(id);
+    if (m && m.size) {
+      // Place in the world, step the springs (they read world-space head motion),
+      // then fall through to the local-space bake below.
+      e.group.position.set(place.px, place.py, place.pz);
+      e.group.quaternion.set(place.qx, place.qy, place.qz, place.qw);
+      e.group.scale.setScalar(place.scale);
+      e.group.updateMatrixWorld(true);
+      const p = this.springParams(id);
+      for (const s of [...m.values()].sort((a, b) => a.depth - b.depth)) stepSpringBone(s, p, dt);
+    }
+    return this.prepareBake(id); // zero the group + refresh for local-space bake
+  }
+
+  /** Re-arm every spring to rest — call before an offline render so its secondary
+   *  motion starts settled and accumulates over the shot. */
+  resetAllSprings(): void {
+    for (const m of this.springs.values()) for (const s of m.values()) resetSpringBone(s);
+  }
+
   removeInstance(id: number): void {
     const e = this.instances.get(id);
     if (e) {
       this.scene.remove(e.group);
       this.instances.delete(id);
     }
+    this.springs.delete(id);
+    this.springParamsById.delete(id);
   }
 
   /** Drop every instance (e.g. before loading a saved scene). */
@@ -412,16 +764,95 @@ export class Preview {
     (pts.material as ShaderMaterial).uniforms.uScale.value = h / (2 * Math.tan(fov / 2));
   }
 
+  /**
+   * Advance every rig by one frame: clip mixers, then cutscene pose overrides,
+   * then spring dynamics. Returns the delta it consumed.
+   *
+   * Split out of `render` because the ray-traced view needs the skeletons to move
+   * without drawing the raster canvas — it bakes the stepped pose into geometry
+   * instead. Call it exactly once per frame from whichever view is live, or the
+   * clock gets consumed twice and animation runs at double speed.
+   */
+  stepAnimation(): number {
+    const dt = this.clock.getDelta();
+    for (const [id, e] of this.instances) {
+      if (!this.posing.has(id)) e.mixer?.update(dt);
+    }
+    // Cutscene poses override the mixer: write keyed local rotations last.
+    for (const { bones, pose } of this.poseOverride.values()) {
+      for (const bp of pose) {
+        const b = bones[bp.i];
+        if (b) b.quaternion.set(bp.q[0], bp.q[1], bp.q[2], bp.q[3]);
+      }
+    }
+    // Spring dynamics layer on the base pose: step shallower bones first so a
+    // chain's parents move before their children each frame.
+    for (const [id, m] of this.springs) {
+      if (m.size === 0) continue;
+      const p = this.springParams(id);
+      const list = [...m.values()].sort((a, b) => a.depth - b.depth);
+      for (const s of list) stepSpringBone(s, p, dt);
+    }
+    return dt;
+  }
+
+  /**
+   * Point an instance at the BLAS it now corresponds to, WITHOUT rebuilding it.
+   *
+   * `syncInstances` rebuilds any instance whose BLAS changed under it, which is
+   * right for an edit or a bake but fatal for the render view's per-frame pose
+   * bake: it would tear down the rigged group and put static geometry in its
+   * place, leaving a skeleton that moves nothing. Re-baking a pose doesn't change
+   * what the preview should be showing, so we just re-point the record.
+   */
+  setInstanceBlas(id: number, blas: BLAS | null): void {
+    const e = this.instances.get(id);
+    if (e) e.blas = blas;
+  }
+
+  /** Is a clip actually driving this rig — a mixer with some weight above zero? */
+  hasPlayingClip(id: number): boolean {
+    if (this.posing.has(id)) return false; // manual posing owns the skeleton
+    const e = this.instances.get(id);
+    return !!e?.mixer && e.weights.some((w) => w > 0);
+  }
+
+  /** Is anything actually moving this rig — a clip playing above zero weight, a
+   *  cutscene pose driving it, or spring bones still settling? */
+  isAnimating(id: number): boolean {
+    if (this.posing.has(id)) return false; // manual posing owns the skeleton
+    if (this.poseOverride.has(id)) return true;
+    if (this.hasSprings(id)) return true;
+    return this.hasPlayingClip(id);
+  }
+
+  /**
+   * Put every playing clip at an ABSOLUTE time, for offline rendering.
+   *
+   * The live views advance clips by whatever the wall clock delivered since the
+   * last frame, which is exactly wrong for an export: frames are rendered as fast
+   * (or as slowly) as the machine manages, so real elapsed time bears no relation
+   * to the frame being written. Sampling each frame at its own timeline position
+   * instead makes the exported motion deterministic and correctly paced — and it
+   * is what makes a clip play across a WebM rather than sitting on frame one.
+   *
+   * `setTime` rewinds to zero and re-runs the mixer, so looping clips wrap the way
+   * they would have on playback.
+   */
+  sampleAnimationAt(timeSec: number): void {
+    for (const [id, e] of this.instances) {
+      if (this.posing.has(id) || !e.mixer) continue;
+      e.mixer.setTime(Math.max(0, timeSec));
+    }
+  }
+
   render(cam: OrbitCamera): void {
     // Terrain/water depend on the camera (patch follows the target), so refresh
     // every frame; the heavy re-displacement is guarded inside syncWorld.
     this.syncWorld(cam);
     this.syncPrims();
 
-    const dt = this.clock.getDelta();
-    for (const [id, e] of this.instances) {
-      if (!this.posing.has(id)) e.mixer?.update(dt);
-    }
+    const dt = this.stepAnimation();
 
     this.camera.position.copy(cam.position);
     this.camera.up.copy(cam.up);

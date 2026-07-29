@@ -13,6 +13,7 @@ import {
   type BufferGeometry,
 } from "three";
 import { buildBVH } from "./bvh";
+import { formatHint } from "./loaders/formatHints";
 import type { BLAS, RawModel } from "../scene/scene";
 
 export const TRI_STRIDE = 32; // floats per triangle (8 vec4)
@@ -65,10 +66,25 @@ function loaderFor(name: string): FormatLoader | undefined {
 export async function importModel(file: File): Promise<ImportResult> {
   const loader = loaderFor(file.name);
   if (!loader) {
+    const hint = formatHint(file.name);
+    if (hint) throw new Error(hint);
     throw new Error(`Unsupported file type. Supported: ${acceptAttribute()}`);
   }
   const { root, animations } = await loader.load(file);
   return buildImportResult(root, file.name, animations ?? []);
+}
+
+/** Load ONLY the animation clips from a file — no geometry baking — so motion can
+ *  be added to an already-imported rig (e.g. a downloaded Mixamo animation FBX,
+ *  which often carries a skeleton and clips but little or no mesh). */
+export async function importAnimations(file: File): Promise<AnimationClip[]> {
+  const loader = loaderFor(file.name);
+  if (!loader) {
+    const hint = formatHint(file.name);
+    throw new Error(hint ?? `Unsupported file type. Supported: ${acceptAttribute()}`);
+  }
+  const { animations } = await loader.load(file);
+  return animations ?? [];
 }
 
 // ---------------------------------------------------------------- shared pipeline

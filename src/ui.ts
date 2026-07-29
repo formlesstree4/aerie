@@ -18,7 +18,7 @@ import {
 import { EmitterType, EMITTER_LABELS, defaultEmitter } from "./gen/particles";
 import { acceptAttribute } from "./mesh/modelImport";
 import { LANDSCAPE_LABELS, LANDSCAPE_TYPES, type LandscapeType } from "./mesh/landscape";
-import type { Ease } from "./scene/cutscene";
+import { EASE_PRESETS, type Ease } from "./scene/cutscene";
 import type { Vector3 } from "three";
 
 /** Bundled API the UI uses to drive the cutscene timeline (camera keyframes). */
@@ -30,7 +30,7 @@ export interface CutsceneController {
   time(): number;
   duration(): number;
   playing(): boolean;
-  keyInfo(i: number): { duration: number; ease: Ease; time: number };
+  keyInfo(i: number): { duration: number; ease: Ease; bezier: [number, number, number, number]; time: number };
   keyAtmo(i: number): { timeOfDay: number; exposure: number; haze: number };
   setKeyAtmo(i: number, field: "timeOfDay" | "exposure" | "haze", v: number): void;
   add(): void;
@@ -39,6 +39,7 @@ export interface CutsceneController {
   select(i: number): void;
   setDuration(i: number, s: number): void;
   setEase(i: number, e: Ease): void;
+  setBezier(i: number, b: [number, number, number, number]): void;
   scrub(t: number): void;
   playPause(): void;
   render(opts: TurntableOptions): void;
@@ -103,6 +104,44 @@ export interface UIHooks {
   boneNames: (inst: MeshInstance) => string[];
   isPosing: () => boolean;
   onTogglePose: (inst: MeshInstance) => void;
+  isIK: () => boolean;
+  onToggleIK: () => void;
+  animateInRender: () => boolean;
+  onToggleAnimateInRender: () => void;
+  selectedBoneCount: () => number;
+  onClearBoneSelection: () => void;
+  hiddenBoneCount: () => number;
+  showAllBones: () => boolean;
+  onToggleShowAllBones: () => void;
+  isSpringBone: (i: number) => boolean;
+  toggleSpringBone: (i: number) => void;
+  hasSprings: () => boolean;
+  springParams: () => { stiffness: number; damping: number; gravity: number };
+  setSpringParam: (key: "stiffness" | "damping" | "gravity", v: number) => void;
+  clearSprings: () => void;
+  clipNames: (inst: MeshInstance) => string[];
+  onImportAnimation: (inst: MeshInstance, file: File) => void;
+  clipWeight: (inst: MeshInstance, i: number) => number;
+  setClipWeight: (inst: MeshInstance, i: number, w: number) => void;
+  clipAdditive: (inst: MeshInstance, i: number) => boolean;
+  toggleClipAdditive: (inst: MeshInstance, i: number) => void;
+  poseClipIndex: () => number;
+  poseClipDuration: () => number;
+  poseClipTime: () => number;
+  onSelectClip: (i: number) => void;
+  onScrubClip: (t: number) => void;
+  onSnapshotClip: () => void;
+  onPoseUndo: () => void;
+  onPoseRedo: () => void;
+  canPoseUndo: () => boolean;
+  canPoseRedo: () => boolean;
+  onCopyPose: () => void;
+  onPastePose: () => void;
+  canPastePose: () => boolean;
+  onResetAllJoints: () => void;
+  onSavePose: () => void;
+  poseLibraryNames: () => string[];
+  onApplyLibraryPose: (i: number) => void;
   poseSelectedBone: () => number;
   onSelectBone: (i: number) => void;
   boneRotation: (i: number) => [number, number, number];
@@ -211,6 +250,164 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
     return b;
   };
 
+  // Interactive cubic-Bézier easing editor: two draggable control handles over a
+  // 0→1 timing curve (bone-green in, joint-amber out — matching the pose overlay).
+  // Drags call setBezier live (no panel rebuild); onCommit runs on release.
+  const easeEditor = (
+    bezier: [number, number, number, number],
+    setBezier: (b: [number, number, number, number]) => void,
+    onCommit: () => void,
+  ): SVGSVGElement => {
+    const NS = "http://www.w3.org/2000/svg";
+    const W = 150, H = 150, pad = 20, yLo = -0.3, yHi = 1.3;
+    const b = bezier.slice() as [number, number, number, number];
+    const sx = (x: number) => pad + x * (W - 2 * pad);
+    const sy = (y: number) => pad + ((yHi - y) / (yHi - yLo)) * (H - 2 * pad);
+    const mk = (tag: string, attrs: Record<string, string>): SVGElement => {
+      const e = document.createElementNS(NS, tag) as SVGElement;
+      for (const k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    };
+    const svg = mk("svg", { viewBox: `0 0 ${W} ${H}`, class: "ease-editor" }) as SVGSVGElement;
+    svg.style.cssText = "width:150px;height:150px;touch-action:none;cursor:crosshair;color:var(--ink,#888)";
+    const frame = mk("rect", { x: `${pad}`, y: `${sy(1)}`, width: `${W - 2 * pad}`, height: `${sy(0) - sy(1)}`, fill: "none", stroke: "currentColor", "stroke-width": "1", opacity: "0.3" });
+    const diag = mk("line", { x1: `${sx(0)}`, y1: `${sy(0)}`, x2: `${sx(1)}`, y2: `${sy(1)}`, stroke: "currentColor", "stroke-dasharray": "3 3", "stroke-width": "1", opacity: "0.35" });
+    const h1line = mk("line", { stroke: "#78dca0", "stroke-width": "1.2", opacity: "0.7" });
+    const h2line = mk("line", { stroke: "#ffe680", "stroke-width": "1.2", opacity: "0.7" });
+    const curve = mk("path", { fill: "none", stroke: "#78dca0", "stroke-width": "2" });
+    const p0 = mk("circle", { r: "2.5", fill: "currentColor", opacity: "0.5" });
+    const p3 = mk("circle", { r: "2.5", fill: "currentColor", opacity: "0.5" });
+    const c1 = mk("circle", { r: "5", fill: "#78dca0" });
+    const c2 = mk("circle", { r: "5", fill: "#ffe680" });
+    svg.append(frame, diag, h1line, h2line, curve, p0, p3, c1, c2);
+
+    const redraw = () => {
+      curve.setAttribute("d", `M ${sx(0)} ${sy(0)} C ${sx(b[0])} ${sy(b[1])} ${sx(b[2])} ${sy(b[3])} ${sx(1)} ${sy(1)}`);
+      h1line.setAttribute("x1", `${sx(0)}`); h1line.setAttribute("y1", `${sy(0)}`); h1line.setAttribute("x2", `${sx(b[0])}`); h1line.setAttribute("y2", `${sy(b[1])}`);
+      h2line.setAttribute("x1", `${sx(1)}`); h2line.setAttribute("y1", `${sy(1)}`); h2line.setAttribute("x2", `${sx(b[2])}`); h2line.setAttribute("y2", `${sy(b[3])}`);
+      c1.setAttribute("cx", `${sx(b[0])}`); c1.setAttribute("cy", `${sy(b[1])}`);
+      c2.setAttribute("cx", `${sx(b[2])}`); c2.setAttribute("cy", `${sy(b[3])}`);
+      p0.setAttribute("cx", `${sx(0)}`); p0.setAttribute("cy", `${sy(0)}`);
+      p3.setAttribute("cx", `${sx(1)}`); p3.setAttribute("cy", `${sy(1)}`);
+    };
+    redraw();
+
+    let active = -1;
+    const toNorm = (ev: PointerEvent) => {
+      const r = svg.getBoundingClientRect();
+      const mx = ((ev.clientX - r.left) / r.width) * W;
+      const my = ((ev.clientY - r.top) / r.height) * H;
+      return {
+        nx: Math.min(1, Math.max(0, (mx - pad) / (W - 2 * pad))),
+        ny: Math.min(yHi, Math.max(yLo, yHi - ((my - pad) / (H - 2 * pad)) * (yHi - yLo))),
+      };
+    };
+    svg.addEventListener("pointerdown", (ev) => {
+      const { nx } = toNorm(ev);
+      active = Math.abs(nx - b[0]) <= Math.abs(nx - b[2]) ? 0 : 1; // nearest handle by x
+      svg.setPointerCapture(ev.pointerId);
+    });
+    svg.addEventListener("pointermove", (ev) => {
+      if (active < 0) return;
+      const { nx, ny } = toNorm(ev);
+      b[active * 2] = nx; b[active * 2 + 1] = ny;
+      setBezier(b.slice() as [number, number, number, number]);
+      redraw();
+    });
+    const end = (ev: PointerEvent) => {
+      if (active < 0) return;
+      active = -1;
+      try { svg.releasePointerCapture(ev.pointerId); } catch { /* not captured */ }
+      onCommit();
+    };
+    svg.addEventListener("pointerup", end);
+    svg.addEventListener("pointercancel", end);
+    return svg;
+  };
+
+  // Dope sheet: keyframes placed along a time axis, with a scrub playhead. Click a
+  // key to select; drag an interior key to retime it (neighbours stay put); click
+  // or drag the track to scrub. Endpoints retime via the duration slider.
+  const dopeSheet = (
+    times: number[],
+    total: number,
+    selected: number,
+    playhead: number,
+    cb: { onSelect: (i: number) => void; onScrub: (t: number) => void; onMoveKey: (i: number, t: number) => void },
+  ): SVGSVGElement => {
+    const NS = "http://www.w3.org/2000/svg";
+    const W = 600, H = 66, padL = 16, padR = 16, trackY = 30;
+    const span = W - padL - padR;
+    const n = times.length;
+    const draggable = (i: number) => i > 0 && i < n - 1; // interior keys keep total fixed
+    const xOf = (t: number) => padL + (total > 0 ? t / total : 0) * span;
+    const mk = (tag: string, attrs: Record<string, string>): SVGElement => {
+      const e = document.createElementNS(NS, tag) as SVGElement;
+      for (const k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    };
+    const svg = mk("svg", { viewBox: `0 0 ${W} ${H}`, class: "cs-dope" }) as SVGSVGElement;
+    svg.style.cssText = "width:100%;height:66px;touch-action:none;cursor:pointer;color:var(--ink,#aaa);display:block";
+    svg.append(mk("line", { x1: `${padL}`, y1: `${trackY}`, x2: `${W - padR}`, y2: `${trackY}`, stroke: "currentColor", "stroke-width": "1.5", opacity: "0.3" }));
+    const tick = (x: number, anchor: string, txt: string) => {
+      const t = mk("text", { x: `${x}`, y: `${H - 6}`, "font-size": "10", fill: "currentColor", opacity: "0.55", "text-anchor": anchor, "font-family": "ui-monospace, monospace" });
+      t.textContent = txt; return t;
+    };
+    svg.append(tick(padL, "start", "0s"), tick(W - padR, "end", `${total.toFixed(1)}s`));
+
+    const groups: SVGElement[] = [];
+    for (let i = 0; i < n; i++) {
+      const g = mk("g", { transform: `translate(${xOf(times[i])},${trackY})` });
+      const on = i === selected;
+      g.append(mk("path", {
+        d: "M 0 -6 L 6 0 L 0 6 L -6 0 Z",
+        fill: on ? "#ffe680" : "#78dca0", stroke: "currentColor", "stroke-width": on ? "1.5" : "1",
+        style: `cursor:${draggable(i) ? "ew-resize" : "pointer"}`,
+      }));
+      const lab = mk("text", { y: "-11", "text-anchor": "middle", "font-size": "9", fill: "currentColor", opacity: "0.7", "font-family": "ui-monospace, monospace" });
+      lab.textContent = `K${i + 1}`;
+      g.append(lab);
+      svg.append(g);
+      groups.push(g);
+    }
+    const ph = mk("g", { transform: `translate(${xOf(playhead)},0)` });
+    ph.append(mk("line", { x1: "0", y1: "8", x2: "0", y2: `${trackY + 9}`, stroke: "#ffe680", "stroke-width": "1.5" }));
+    ph.append(mk("path", { d: "M -4 8 L 4 8 L 0 14 Z", fill: "#ffe680" }));
+    svg.append(ph);
+
+    const lxOf = (cx: number) => { const r = svg.getBoundingClientRect(); return ((cx - r.left) / r.width) * W; };
+    const tOf = (cx: number) => Math.max(0, Math.min(total, span > 0 ? ((lxOf(cx) - padL) / span) * total : 0));
+
+    let dragKey = -1, dragPlay = false, clickKey = -1;
+    svg.addEventListener("pointerdown", (ev) => {
+      const lx = lxOf(ev.clientX);
+      let hit = -1, best = 12;
+      for (let i = 0; i < n; i++) { const d = Math.abs(lx - xOf(times[i])); if (d < best) { best = d; hit = i; } }
+      svg.setPointerCapture(ev.pointerId);
+      if (hit >= 0) { clickKey = hit; dragKey = draggable(hit) ? hit : -1; }
+      else { dragPlay = true; const t = tOf(ev.clientX); cb.onScrub(t); ph.setAttribute("transform", `translate(${xOf(t)},0)`); }
+    });
+    svg.addEventListener("pointermove", (ev) => {
+      if (dragKey > 0) {
+        const prev = times[dragKey - 1], next = times[dragKey + 1];
+        const t = Math.max(prev + 0.01, Math.min(tOf(ev.clientX), next - 0.01));
+        groups[dragKey].setAttribute("transform", `translate(${xOf(t)},${trackY})`);
+        cb.onMoveKey(dragKey, t);
+      } else if (dragPlay) {
+        const t = tOf(ev.clientX); cb.onScrub(t); ph.setAttribute("transform", `translate(${xOf(t)},0)`);
+      }
+    });
+    const end = (ev: PointerEvent) => {
+      try { svg.releasePointerCapture(ev.pointerId); } catch { /* not captured */ }
+      if (dragKey > 0) cb.onSelect(dragKey);       // retimed → refresh + reselect
+      else if (clickKey >= 0) cb.onSelect(clickKey); // plain click → select
+      dragKey = -1; dragPlay = false; clickKey = -1;
+    };
+    svg.addEventListener("pointerup", end);
+    svg.addEventListener("pointercancel", end);
+    return svg;
+  };
+
   // Hidden file pickers, created once and triggered from the Scene menu.
   const sceneFileInput = el("input");
   sceneFileInput.type = "file";
@@ -237,7 +434,18 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
     if (f) hooks.onImportToGallery(f);
     galleryFileInput.value = ""; // allow re-importing the same file
   });
-  document.body.append(sceneFileInput, modelFileInput, galleryFileInput);
+  // Animation-only import: adds clips to a chosen rig (set when the button is clicked).
+  let animTarget: MeshInstance | null = null;
+  const animFileInput = el("input");
+  animFileInput.type = "file";
+  animFileInput.accept = ".fbx,.glb,.gltf,.dae";
+  animFileInput.style.display = "none";
+  animFileInput.addEventListener("change", () => {
+    const f = animFileInput.files?.[0];
+    if (f && animTarget) hooks.onImportAnimation(animTarget, f);
+    animFileInput.value = ""; // allow re-importing the same file
+  });
+  document.body.append(sceneFileInput, modelFileInput, galleryFileInput, animFileInput);
 
   function slider(
     label: string,
@@ -733,21 +941,22 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
       return;
     }
 
-    const scrub = el("input", "cs-scrub") as HTMLInputElement;
-    scrub.type = "range"; scrub.min = "0"; scrub.max = String(Math.max(0.0001, total));
-    scrub.step = "0.01"; scrub.value = String(cs.time());
-    scrub.addEventListener("input", () => cs.scrub(parseFloat(scrub.value)));
-    cutsceneDock.append(scrub);
-
-    const strip = el("div", "cs-keys");
-    for (let i = 0; i < n; i++) {
-      const info = cs.keyInfo(i);
-      const chip = el("div", "cs-key" + (i === cs.selected() ? " sel" : ""));
-      chip.append(el("div", "cs-k-i", `K${i + 1}`), el("div", "cs-k-t", `${info.time.toFixed(1)}s`));
-      chip.addEventListener("click", () => cs.select(i));
-      strip.append(chip);
-    }
-    cutsceneDock.append(strip);
+    // Dope sheet — keyframes on a time axis + scrub playhead (replaces the plain
+    // range scrubber and the flat key strip).
+    const times = Array.from({ length: n }, (_, i) => cs.keyInfo(i).time);
+    cutsceneDock.append(dopeSheet(times, total, cs.selected(), cs.time(), {
+      onSelect: (i) => cs.select(i),
+      onScrub: (t) => cs.scrub(t),
+      onMoveKey: (i, t) => {
+        // Keep neighbours fixed: split the change between this key's incoming
+        // duration and the next key's, so only key `i` moves.
+        const prev = times[i - 1], next = times[i + 1];
+        const tt = Math.max(prev + 0.01, Math.min(t, next - 0.01));
+        cs.setDuration(i, tt - prev);
+        cs.setDuration(i + 1, next - tt);
+      },
+    }));
+    cutsceneDock.append(el("div", "hint", "Drag interior keys to retime; drag the track to scrub."));
 
     const sel = cs.selected();
     if (sel >= 0 && sel < n) {
@@ -755,13 +964,21 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
       const ed = el("div", "cs-editor");
       if (sel > 0) ed.append(plainSlider("duration", info.duration, 0, 20, 0.1, (v) => cs.setDuration(sel, v)));
       else ed.append(el("div", "hint", "First keyframe is the start (no incoming duration)."));
-      const easeRow = el("div", "btns");
-      (["smooth", "linear"] as Ease[]).forEach((e) => {
-        const b = button(e, () => cs.setEase(sel, e));
-        if (info.ease === e) b.classList.add("on");
-        easeRow.append(b);
-      });
-      ed.append(easeRow);
+
+      // Easing: the timing of the incoming segment. Presets + a draggable curve.
+      if (sel > 0) {
+        ed.append(el("div", "hint", "Easing — the timing into this key"));
+        const bz = info.bezier;
+        const presetRow = el("div", "btns");
+        for (const p of EASE_PRESETS) {
+          const on = bz[0] === p.bezier[0] && bz[1] === p.bezier[1] && bz[2] === p.bezier[2] && bz[3] === p.bezier[3];
+          const b = button(p.name, () => { cs.setBezier(sel, p.bezier.slice() as [number, number, number, number]); refresh(); });
+          if (on) b.classList.add("on");
+          presetRow.append(b);
+        }
+        ed.append(presetRow);
+        ed.append(easeEditor(bz, (b) => cs.setBezier(sel, b), () => refresh()));
+      }
 
       // Atmosphere: animate time of day (sun + sky), exposure and haze per key.
       const atmo = cs.keyAtmo(sel);
@@ -1050,6 +1267,31 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
           box.append(el("div", "hint", "This model has no rig (skeleton) to pose."));
         } else {
           const posing = hooks.isPosing();
+
+          // Import ready-made motion (e.g. a Mixamo animation) onto this rig.
+          if (!posing) {
+            box.append(button("＋ Import animation…", () => { animTarget = m; animFileInput.click(); }));
+            box.append(el("div", "hint", "Add a clip from an FBX / glTF. Best when its skeleton matches this model (e.g. Mixamo → Mixamo)."));
+          }
+
+          // Clip mixer: set a weight above 0 to play a clip; blend several by
+          // weight; additive layers on top. Plays live only when not posing.
+          const mixClips = hooks.clipNames(m);
+          if (mixClips.length >= 1 && !posing) {
+            box.append(el("div", "hint", mixClips.length > 1 ? "Play / blend clips — weight each; additive layers on top" : "Play clip — set the weight above 0"));
+            mixClips.forEach((name, i) => {
+              box.append(plainSlider(name, hooks.clipWeight(m, i), 0, 1, 0.01, (v) => hooks.setClipWeight(m, i, v)));
+              const add = hooks.clipAdditive(m, i);
+              const b = button(add ? "additive" : "normal", () => { hooks.toggleClipAdditive(m, i); refresh(); });
+              b.classList.add("mini");
+              if (add) b.classList.add("on");
+              box.append(b);
+            });
+            box.append(el("div", "hint", mixClips.length > 1
+              ? "Two normal clips at 0.5 blend halfway; set a gesture to additive to layer it over a base."
+              : "Weight 1 plays it live; import more to blend."));
+          }
+
           box.append(
             button(posing ? "✓ Done posing" : `Pose rig (${bones.length} bones)`, () => {
               hooks.onTogglePose(m);
@@ -1057,7 +1299,48 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
             }),
           );
           if (posing) {
-            box.append(el("div", "hint", "Click a joint and drag to rotate it; or use the sliders."));
+            const ik = hooks.isIK();
+            box.append(
+              button(ik ? "Posing: IK (drag limbs)" : "Posing: FK (rotate joint)", () => {
+                hooks.onToggleIK();
+                refresh();
+              }),
+            );
+            box.append(el("div", "hint", ik
+              ? "Drag any joint — an elbow, a knee, a fingertip. Everything below it comes along; the edit stops at the shoulder / hip so the body stays put. Hover a joint to see what will move (amber bends, blue follows, ○ holds still); hold Shift to reach one bone further up."
+              : "Drag the X / Y / Z rings on the selected joint to rotate it (Shift snaps 15°); drag a joint to free-rotate."));
+
+            // Dense rigs hide their helper bones by default — offer the way back.
+            const hiddenBones = hooks.hiddenBoneCount();
+            if (hiddenBones > 0 || hooks.showAllBones()) {
+              box.append(button(hooks.showAllBones() ? "Hide helper joints" : `Show all joints (${hiddenBones} hidden)`, () => {
+                hooks.onToggleShowAllBones();
+                refresh();
+              }));
+              box.append(el("div", "hint", hooks.showAllBones()
+                ? "Showing every bone, including twist / cloth / corrective helpers that don't visibly deform the mesh."
+                : "Helper bones (twist, cloth, correctives) are hidden — they move the skeleton but not the model."));
+            }
+
+            // Imported clips: scrub to a frame and use it as a starting pose.
+            const clips = hooks.clipNames(m);
+            if (clips.length) {
+              box.append(el("div", "hint", "Animation clip"));
+              box.append(
+                dropdown(
+                  "clip",
+                  hooks.poseClipIndex(),
+                  clips.map((n, i) => [i, n] as [number, string]),
+                  (v) => { hooks.onSelectClip(v); refresh(); },
+                ),
+              );
+              const dur = hooks.poseClipDuration();
+              if (dur > 0) {
+                box.append(slider("frame", hooks.poseClipTime(), 0, dur, Math.max(0.001, dur / 120), (v) => hooks.onScrubClip(v)));
+              }
+              box.append(button("Set this frame as the pose", () => { hooks.onSnapshotClip(); refresh(); }));
+              box.append(el("div", "hint", "Scrub to a frame, tweak the joints, then lock it in as the rig's pose."));
+            }
 
             // Root (whole-armature) translation.
             if (hooks.poseRootIndex() >= 0) {
@@ -1070,7 +1353,15 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
             }
 
             const sel = hooks.poseSelectedBone();
-            box.append(el("div", "hint", "Bone rotation"));
+            const selCount = hooks.selectedBoneCount();
+            if (selCount > 1) {
+              box.append(el("div", "hint", `${selCount} joints selected`));
+              box.append(el("div", "hint", ik
+                ? "Drag any of them in the view and the whole set moves together, each solving its own limb."
+                : "The X / Y / Z rings turn every selected joint by the same amount — good for curling a whole hand."));
+              box.append(button("Clear multi-selection", () => { hooks.onClearBoneSelection(); refresh(); }));
+            }
+            box.append(el("div", "hint", selCount > 1 ? "Active joint" : "Selected joint"));
             box.append(
               dropdown(
                 "bone",
@@ -1080,12 +1371,40 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
               ),
             );
             if (sel >= 0) {
-              const r = hooks.boneRotation(sel);
-              box.append(slider("rot x", r[0], -3.14, 3.14, 0.01, (v) => hooks.setBoneRotation(sel, 0, v)));
-              box.append(slider("rot y", r[1], -3.14, 3.14, 0.01, (v) => hooks.setBoneRotation(sel, 1, v)));
-              box.append(slider("rot z", r[2], -3.14, 3.14, 0.01, (v) => hooks.setBoneRotation(sel, 2, v)));
-              box.append(button("Reset bone", () => { hooks.resetBone(sel); refresh(); }));
+              box.append(el("div", "hint", ik
+                ? "Drag a hand or foot in the view to pose the limb. Ctrl-click joints (or box-select with the Select tool) to move several at once."
+                : "Drag the colored X / Y / Z rings on the joint to rotate it; hold Shift to snap to 15°."));
+              box.append(button("Reset joint", () => { hooks.resetBone(sel); refresh(); }));
+              const spring = hooks.isSpringBone(sel);
+              const sb = button(spring ? "✓ Spring bone (dynamic)" : "Make spring bone", () => { hooks.toggleSpringBone(sel); refresh(); });
+              if (spring) sb.classList.add("on");
+              box.append(sb);
             }
+
+            // Spring dynamics: secondary motion for whatever bones are marked.
+            if (hooks.hasSprings()) {
+              box.append(el("div", "hint", "Spring dynamics — tails, hair, cloth swing as the model moves"));
+              const sp = hooks.springParams();
+              box.append(plainSlider("stiffness", sp.stiffness, 0, 1, 0.02, (v) => hooks.setSpringParam("stiffness", v)));
+              box.append(plainSlider("damping", sp.damping, 0, 1, 0.02, (v) => hooks.setSpringParam("damping", v)));
+              box.append(plainSlider("gravity", sp.gravity, 0, 3, 0.05, (v) => hooks.setSpringParam("gravity", v)));
+              box.append(button("Clear spring bones", () => { hooks.clearSprings(); refresh(); }));
+              box.append(el("div", "hint", "Mark a chain of joints (e.g. a tail), then move the model — they lag and settle."));
+            }
+
+            // Pose tools: undoable (Ctrl+Z), copy/paste, reset, and a session library.
+            box.append(el("div", "hint", "Pose tools"));
+            if (hooks.canPoseUndo()) box.append(button("↶ Undo joint edit", () => { hooks.onPoseUndo(); refresh(); }));
+            if (hooks.canPoseRedo()) box.append(button("↷ Redo joint edit", () => { hooks.onPoseRedo(); refresh(); }));
+            box.append(button("Copy pose", () => { hooks.onCopyPose(); refresh(); }));
+            if (hooks.canPastePose()) box.append(button("Paste pose", () => { hooks.onPastePose(); refresh(); }));
+            box.append(button("Reset all joints", () => { hooks.onResetAllJoints(); refresh(); }));
+            box.append(button("Save pose to library", () => { hooks.onSavePose(); refresh(); }));
+            const lib = hooks.poseLibraryNames();
+            for (let i = 0; i < lib.length; i++) {
+              box.append(button(`Apply ${lib[i]}`, () => { hooks.onApplyLibraryPose(i); refresh(); }));
+            }
+
             box.append(button("Bake pose → render", () => hooks.onBakePose()));
             box.append(el("div", "hint", "Bakes the posed model into the ray-traced view."));
           }
@@ -1489,6 +1808,16 @@ export function buildUI(scene: Scene, getSpawn: () => Vector3, hooks: UIHooks): 
         );
         g.append(fb);
         g.append(el("div", "hint", "Aperture 0 = all sharp; higher blurs everything off the focal plane."));
+      }));
+
+      box.append(group("Animation", (g) => {
+        g.append(button(hooks.animateInRender() ? "Animation: playing" : "Animation: frozen", () => {
+          hooks.onToggleAnimateInRender();
+          refresh();
+        }));
+        g.append(el("div", "hint", hooks.animateInRender()
+          ? "Rigs are re-baked into the traced geometry every frame, so clips and spring bones play here as well as in the preview. Moving geometry restarts the sample accumulation, so an animated view stays at 1 sample/frame — freeze it to let a held pose refine."
+          : "The traced view holds the last baked pose. Clips still play in the raster preview."));
       }));
 
       box.append(group("Turntable", (g) => {

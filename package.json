@@ -3,11 +3,12 @@
   "version": "1.0.1",
   "private": true,
   "type": "module",
-  "description": "A browser-based spiritual successor to Bryce 2 — modern asset import, retro ray-traced renders.",
+  "description": "A browser-based spiritual successor to Bryce 2 \u2014 modern asset import, retro ray-traced renders.",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:pose": "node --experimental-strip-types src/mesh/poseChain.test.mts && node --experimental-strip-types src/mesh/poseGroup.test.mts && node --experimental-strip-types src/mesh/clipSample.test.mts && node --experimental-strip-types src/scene/cutscene.test.mts"
   },
   "dependencies": {
     "three": "^0.171.0",

@@ -1,10 +1,12 @@
 import { Renderer } from "./webgpu/renderer";
 import { OrbitCamera } from "./scene/camera";
-import { defaultScene, Primitive, MeshInstance, Light, Emitter, LightType, PrimType, PrimPattern, PRIM_LABELS, type Selectable, type SceneState } from "./scene/scene";
+import { defaultScene, Primitive, MeshInstance, Light, Emitter, LightType, PrimType, PrimPattern, PRIM_LABELS, type Selectable, type SceneState, type BLAS } from "./scene/scene";
 import { SCENE_PRESETS, type ScenePreset, type CameraHint } from "./scene/presets";
 import { buildUI, type ScatterOptions, type TurntableOptions } from "./ui";
 import { Preview } from "./preview";
-import { importModel, bakePose, worldMesh } from "./mesh/modelImport";
+import { importModel, importAnimations, bakePose, worldMesh } from "./mesh/modelImport";
+import { solveTwoBoneIK, solveCCD, autoPole } from "./mesh/ik";
+import { ikChain as poseIkChain, boneSubtree } from "./mesh/poseChain";
 import "./mesh/loaders"; // registers glTF / FBX / STL / PLY loaders
 import { convertPrimitive, primitiveGeometry } from "./mesh/tessellate";
 import { landscapeModel, defaultLandform, LANDSCAPE_HALF, type LandscapeType } from "./mesh/landscape";
@@ -13,7 +15,7 @@ import { csgBuildModel, trisToGeometry, type BoolInput, type MatDesc } from "./m
 import { serializeScene, deserializeScene, previewFromBlas, b64ToU8 } from "./scene/serialize";
 import { buildEditMesh, rebuildBlas, type EditMesh } from "./mesh/editmesh";
 import { History } from "./scene/history";
-import { evalCutscene, cutsceneDuration, keyTime, type CamKey, type Ease, type ObjXform } from "./scene/cutscene";
+import { evalCutscene, cutsceneDuration, keyTime, poseVariesAcrossKeys, type CamKey, type CamState, type Ease, type ObjXform, type BonePose } from "./scene/cutscene";
 import { evaluateEmitter, MAX_PARTICLES, PARTICLE_FLOATS } from "./gen/particles";
 import { Muxer, ArrayBufferTarget } from "webm-muxer";
 import { Vector3, Euler, Matrix3, Matrix4, Quaternion, type Object3D } from "three";
@@ -113,6 +115,155 @@ async function main() {
   const qWorld = new Quaternion();
   const qDeltaA = new Quaternion();
   const qDeltaB = new Quaternion();
+  // IK posing: when enabled, dragging a joint solves a chain of ancestors so the
+  // joint follows the cursor and its whole subtree rides along. `ikChain` picks
+  // the chain from the skeleton's shape (see below) — a 3-bone limb takes the
+  // exact two-bone solver, anything else CCD. Joints with no usable chain fall
+  // back to FK.
+  let ikEnabled = true;
+  let hoverBone = -1;         // joint under the cursor in pose mode (drag preview)
+  let hoverExtend = false;    // Shift held → the preview shows the extended chain
+  // Multi-joint selection. `selectedBone` stays the active joint (the one the FK
+  // rings and the panel act on); `boneSel` is the wider set a drag moves together.
+  // Ctrl-click toggles membership, the Box-Select tool rubber-bands over joints.
+  const boneSel = new Set<number>();
+  // One entry per selected joint during a group drag: where it started and the
+  // chain that carries it there.
+  type MultiGrab = { bone: Object3D; start: Vector3; chain: Object3D[]; pole: Vector3 | null; depth: number };
+  let multiGrab: MultiGrab[] = [];
+  const multiHit0 = new Vector3(); // cursor position on the drag plane at grab time
+  let ikRoot: Object3D | null = null;
+  let ikMid: Object3D | null = null;
+  let ikTip: Object3D | null = null;
+  let ikChainArr: Object3D[] | null = null; // full chain (root→tip) for the CCD path
+  const ikPole = new Vector3();       // world-space bend hint, captured at drag start
+  const ikPlanePoint = new Vector3(); // camera-facing drag plane through the effector
+  // FK rotation-ring gizmo: drag a ring to rotate the selected bone about one of
+  // its local axes, applied as a quaternion (gimbal-free — no Euler). Shown in FK
+  // mode only; IK mode uses limb dragging instead.
+  let gzAxis = -1;                       // 0/1/2 local axis being dragged, or -1
+  const gzStartQuat = new Quaternion();  // bone local rotation at drag start
+  const gzAxisWorld = new Vector3();     // dragged axis in world space (drag-plane normal)
+  const gzRefU = new Vector3();          // in-plane reference direction (angle origin)
+  const gzCenter = new Vector3();        // joint world position (drag-plane point)
+  let gzPrevAngle = 0;                   // last in-plane angle (for unwrapped accumulation)
+  let gzAccum = 0;                       // accumulated signed rotation this drag
+  const gzUnit = [new Vector3(1, 0, 0), new Vector3(0, 1, 0), new Vector3(0, 0, 1)];
+  const gzN = new Vector3(), gzTmpU = new Vector3(), gzTmpV = new Vector3();
+  const gzHit = new Vector3(), gzQ = new Quaternion(), gzBoneWQ = new Quaternion();
+  // Other selected joints turning with the gizmo, and their pre-drag rotations.
+  let gzGroup: { bone: Object3D; start: Quaternion }[] = [];
+
+  // Pose ergonomics: a pose-local undo/redo stack (the scene History snapshots
+  // SceneState, not the live skeleton), a copy/paste clipboard, and a session
+  // pose library. Poses are per-bone local quaternions, indexed by bone.
+  type PoseSnap = { i: number; q: [number, number, number, number] }[];
+  let poseUndo: PoseSnap[] = [];
+  let poseRedo: PoseSnap[] = [];
+  let poseDragSnap: PoseSnap | null = null; // pre-drag pose, pushed on release if it changed
+  let poseClipboard: PoseSnap | null = null;
+  const poseLibrary: { name: string; pose: PoseSnap }[] = [];
+  const POSE_UNDO_LIMIT = 60;
+
+  function capturePose(): PoseSnap {
+    return poseBones.map((b, i) => ({
+      i, q: [b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w] as [number, number, number, number],
+    }));
+  }
+  function applyPose(p: PoseSnap): void {
+    for (const bp of p) {
+      const b = poseBones[bp.i];
+      if (b) b.quaternion.set(bp.q[0], bp.q[1], bp.q[2], bp.q[3]);
+    }
+  }
+  function posesDiffer(a: PoseSnap, b: PoseSnap): boolean {
+    if (a.length !== b.length) return true;
+    for (let k = 0; k < a.length; k++) {
+      const p = a[k].q, q = b[k].q;
+      if (Math.abs(p[0] - q[0]) + Math.abs(p[1] - q[1]) + Math.abs(p[2] - q[2]) + Math.abs(p[3] - q[3]) > 1e-6) return true;
+    }
+    return false;
+  }
+  /** Record `snap` (a pre-edit pose) as the state an undo returns to. */
+  function pushPoseUndo(snap: PoseSnap): void {
+    poseUndo.push(snap);
+    if (poseUndo.length > POSE_UNDO_LIMIT) poseUndo.shift();
+    poseRedo.length = 0;
+  }
+  function poseUndoStep(): void {
+    if (!poseInst || poseUndo.length === 0) return;
+    poseRedo.push(capturePose());
+    applyPose(poseUndo.pop()!);
+    ui.refresh();
+  }
+  function poseRedoStep(): void {
+    if (!poseInst || poseRedo.length === 0) return;
+    poseUndo.push(capturePose());
+    applyPose(poseRedo.pop()!);
+    ui.refresh();
+  }
+
+  // Discrete pose ops (each is one undo step). Paste/library only apply to a rig
+  // with the same bone count, so an index-based pose can't scramble another rig.
+  function copyPose(): void { if (poseInst) poseClipboard = capturePose(); }
+  function pastePose(): void {
+    if (!poseInst || !poseClipboard || poseClipboard.length !== poseBones.length) return;
+    pushPoseUndo(capturePose());
+    applyPose(poseClipboard);
+    ui.refresh();
+  }
+  function resetAllJoints(): void {
+    if (!poseInst) return;
+    pushPoseUndo(capturePose());
+    for (let i = 0; i < poseBones.length; i++) {
+      const o = poseOrig[i];
+      if (o) poseBones[i].rotation.set(o[0], o[1], o[2]);
+    }
+    ui.refresh();
+  }
+  function savePose(): void {
+    if (poseInst) poseLibrary.push({ name: `Pose ${poseLibrary.length + 1}`, pose: capturePose() });
+  }
+  function applyLibraryPose(idx: number): void {
+    const entry = poseLibrary[idx];
+    if (!poseInst || !entry || entry.pose.length !== poseBones.length) return;
+    pushPoseUndo(capturePose());
+    applyPose(entry.pose);
+    ui.refresh();
+  }
+
+  // ---- which joints are worth showing ----
+  // A dense character rig carries hundreds of bones that deform nothing visible:
+  // twist and roll helpers, cloth and jiggle chains, correctives, attachment
+  // points. Drawn as a dot each, they bury the joints you actually pose and make
+  // it easy to grab one that moves the skeleton and not the model. So the
+  // overlay only offers bones that carry real skin weight — plus whatever is
+  // needed to keep those connected to the root.
+  let poseDeforms: boolean[] = [];   // per bone: does moving it deform the mesh?
+  let poseShowAll = false;           // override, for rigs where the filter guesses wrong
+  const DEFORM_MIN = 1.0;            // total skin weight: below this it's a helper
+
+  /** A bone is offered if it deforms geometry, or if it's on the path from the
+   *  root to one that does (so chains and overlay lines stay connected). */
+  function buildDeformSet(inst: MeshInstance): void {
+    const inf = preview.boneInfluence(inst.id);
+    poseDeforms = new Array(poseBones.length).fill(true);
+    if (!inf) return;
+    const index = new Map<Object3D, number>(poseBones.map((b, i) => [b, i]));
+    const keep = poseBones.map((_, i) => inf[i] >= DEFORM_MIN);
+    for (let i = 0; i < poseBones.length; i++) {
+      if (!keep[i]) continue;
+      for (let p = poseBones[i].parent; p; p = p.parent) { // link it back to the root
+        const pi = index.get(p);
+        if (pi === undefined || keep[pi]) break;
+        keep[pi] = true;
+      }
+    }
+    if (keep.some(Boolean)) poseDeforms = keep; // never filter everything away
+  }
+
+  /** Bones the overlay draws and the cursor can grab. */
+  const boneOffered = (i: number) => poseShowAll || poseDeforms[i] !== false;
 
   function togglePose(inst: MeshInstance): void {
     if (poseInst === inst) {
@@ -120,22 +271,32 @@ async function main() {
       poseInst = null;
       poseBones = [];
       selectedBone = -1;
+      boneSel.clear();
       poseRoot = -1;
+      hoverBone = -1;
+      canvas.style.cursor = "";
+      poseUndo = []; poseRedo = []; poseDragSnap = null;
       return;
     }
     const bones = preview.getBones(inst.id);
     if (!bones || bones.length === 0) return; // not rigged
+    preview.clearPoseOverrides(); // manual posing takes the skeleton off the timeline
+    poseUndo = []; poseRedo = []; poseDragSnap = null;
     poseInst = inst;
     poseBones = bones;
     selectedBone = 0;
+    boneSel.clear();
     poseOrig.length = 0;
     for (const b of bones) poseOrig.push([b.rotation.x, b.rotation.y, b.rotation.z]);
     // Root = first bone whose parent isn't itself a bone.
     const boneSet = new Set(bones);
     poseRoot = bones.findIndex((b) => !b.parent || !boneSet.has(b.parent));
     if (poseRoot >= 0) poseRootOrig.copy(bones[poseRoot].position);
+    buildDeformSet(inst);
+    console.log(`[pose] ${preview.rigReport(inst.id)}`);
     preview.setPosing(inst.id, true);
-    mode = "preview"; // skinned deformation is only live in the raster preview
+    mode = "preview"; // the raster view is the responsive place to pose (the ray
+                      // view keeps up too, but re-bakes the rig on every drag frame)
     applyMode();
   }
 
@@ -159,6 +320,118 @@ async function main() {
     } finally {
       importing = false;
     }
+  }
+
+  // ---- animation in the ray-traced view ----
+  // The raster preview shows skinning live, because three deforms the mesh on the
+  // GPU every frame. The ray tracer traces a BVH built from static triangles, so a
+  // moving rig has to be re-baked into that geometry frame by frame. That's real
+  // work (skin + rebuild the BLAS) and every change restarts the sample
+  // accumulation, so it's deliberately limited to rigs that are actually moving:
+  // a still scene re-converges to a clean image on its own.
+  let animateInRender = true;
+  const lastBakedPose = new Map<number, Float32Array>(); // per instance: bone quats at last bake
+
+  /** Current bone rotations, flat, for the cheap "has this rig moved?" test. */
+  function poseSignature(id: number): Float32Array | null {
+    const bones = preview.getBones(id);
+    if (!bones) return null;
+    const out = new Float32Array(bones.length * 4);
+    for (let i = 0; i < bones.length; i++) {
+      const q = bones[i].quaternion;
+      out[i * 4] = q.x; out[i * 4 + 1] = q.y; out[i * 4 + 2] = q.z; out[i * 4 + 3] = q.w;
+    }
+    return out;
+  }
+  function poseChanged(a: Float32Array, b: Float32Array | undefined): boolean {
+    if (!b || a.length !== b.length) return true;
+    for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > 1e-5) return true;
+    return false;
+  }
+
+  /**
+   * Step every animating rig and bake the ones that moved into their BLAS.
+   * Returns true if geometry changed (so the caller re-uploads and restarts the
+   * accumulation). No-ops when nothing is playing, which is what lets a paused
+   * scene still accumulate its full sample count.
+   */
+  function stepRenderAnimation(): boolean {
+    preview.syncInstances(scene);
+    // Always step — it also drains the shared clock, so returning to the raster
+    // view doesn't jump forward by however long the ray trace was on screen.
+    preview.stepAnimation(); // mixers + cutscene overrides + springs, without drawing
+    if (!animateInRender) return false;
+    // Manual posing counts as motion too: dragging a joint re-bakes each frame,
+    // and the moment you let go the dirty check goes quiet and the image refines.
+    const live = scene.instances.filter((inst) => preview.isAnimating(inst.id) || preview.isPosing(inst.id));
+
+    let baked = false;
+    for (const inst of live) {
+      const sig = poseSignature(inst.id);
+      if (!sig || !poseChanged(sig, lastBakedPose.get(inst.id))) continue;
+      const inner = preview.prepareBake(inst.id);
+      if (!inner) continue;
+      // replaceBlas clears blasFile — the link save/load re-imports the rig from.
+      // A transient render-view bake must not cost the scene its rig, so put it back.
+      const file = scene.blasFile[inst.blasIndex];
+      scene.replaceBlas(inst.blasIndex, bakePose(inner, scene.blasMatBase[inst.blasIndex]));
+      scene.blasFile[inst.blasIndex] = file;
+      // Keep the preview pointed at the new BLAS, or syncInstances would tear the
+      // rigged group down and rebuild it as static geometry — a skeleton driving
+      // nothing. The rig itself hasn't changed; only its baked snapshot has.
+      preview.setInstanceBlas(inst.id, scene.blases[inst.blasIndex]);
+      lastBakedPose.set(inst.id, sig);
+      baked = true;
+    }
+    if (baked) {
+      preview.syncInstances(scene); // restore the group transforms prepareBake zeroed
+      renderer.uploadMeshPools(scene);
+      renderer.resetAccumulation(); // the geometry moved — start the image again
+    }
+    return baked;
+  }
+
+  // ---- offline (WebM) rig baking ----
+  // Same idea as the live render view, but driven by the frame's timeline position
+  // rather than the wall clock, and reversible: an export must never leave the
+  // scene holding baked geometry, so every BLAS it swaps is recorded for restore.
+  type BlasSnap = { blas: BLAS; file: (typeof scene.blasFile)[number] };
+  const bakeQuat = new Quaternion();
+
+  /** Bake one rigged instance's current pose (clip- and/or keyframe-driven, plus
+   *  spring dynamics stepped by `shutter`) into its BLAS for an offline frame. */
+  function bakeRigFrame(
+    obj: MeshInstance,
+    pose: BonePose[] | null,
+    shutter: number,
+    restore: Map<number, BlasSnap>,
+  ): boolean {
+    if (!restore.has(obj.blasIndex)) {
+      restore.set(obj.blasIndex, { blas: scene.blases[obj.blasIndex], file: scene.blasFile[obj.blasIndex] });
+    }
+    bakeQuat.setFromEuler(obj.rotation);
+    const place = {
+      px: obj.position.x, py: obj.position.y, pz: obj.position.z,
+      qx: bakeQuat.x, qy: bakeQuat.y, qz: bakeQuat.z, qw: bakeQuat.w, scale: obj.scale,
+    };
+    const inner = preview.prepareBakePosedDynamic(obj.id, pose, place, shutter);
+    if (!inner) return false;
+    scene.replaceBlas(obj.blasIndex, bakePose(inner, scene.blasMatBase[obj.blasIndex]));
+    preview.setInstanceBlas(obj.id, scene.blases[obj.blasIndex]); // don't let syncInstances rebuild the rig
+    return true;
+  }
+
+  /** Put every BLAS an export swapped back, so the scene is exactly as it was. */
+  function restoreBakedBlas(restore: Map<number, BlasSnap>): void {
+    if (!restore.size) return;
+    for (const [bi, snap] of restore) {
+      scene.replaceBlas(bi, snap.blas);
+      scene.blasFile[bi] = snap.file; // restore the re-import link replaceBlas cleared
+    }
+    for (const inst of scene.instances) preview.setInstanceBlas(inst.id, scene.blases[inst.blasIndex] ?? null);
+    preview.syncInstances(scene); // restore preview group transforms zeroed by the bake
+    restore.clear();
+    lastBakedPose.clear(); // rest geometry is back — the live view must re-bake
   }
 
   function bakeSelected() {
@@ -492,11 +765,12 @@ async function main() {
   function applySceneState(state: SceneState, label: string) {
     scene.restoreState(state);
     editInstance = null; editMesh = null;
-    poseInst = null; poseBones = []; selectedBone = -1;
+    poseInst = null; poseBones = []; selectedBone = -1; boneSel.clear();
     selectedVerts.clear();
     preview.clearInstances();
     preview.syncInstances(scene);
     cutsceneKeys = []; cutsceneMode = false; cutsceneSel = -1; cutsceneTime = 0; cutscenePlaying = false; cutsceneHome = null;
+    cutsceneKeysVersion++;
     mode = "render";
     applyMode();
     savedVersion = scene.version;
@@ -920,7 +1194,7 @@ async function main() {
       const data = deserializeScene(scene, text);
       // Exit any per-object modes that reference now-gone objects.
       editInstance = null; editMesh = null;
-      poseInst = null; poseBones = []; selectedBone = -1;
+      poseInst = null; poseBones = []; selectedBone = -1; boneSel.clear();
       preview.clearInstances();
 
       const savedInstances = data.mesh?.instances ?? [];
@@ -971,6 +1245,7 @@ async function main() {
       cutsceneSel = cutsceneKeys.length ? 0 : -1;
       cutsceneTime = 0; cutscenePlaying = false; cutsceneMode = false; cutsceneHome = null;
       if (cutsceneKeys.length) cutsceneKeys[0].duration = 0;
+      cutsceneKeysVersion++;
 
       ui.select(scene.prims[0] ?? scene.instances[0] ?? scene.lights[0] ?? null);
       history.commit();
@@ -1263,13 +1538,26 @@ async function main() {
     const frames = Math.max(1, Math.round(o.seconds * o.fps));
     const startYaw = cam.yaw;
     const shutter = 1 / o.fps;
+    // Rigs keep playing while the camera orbits: sample each clip at this frame's
+    // time and bake it, exactly as the cutscene export does.
+    const bakeRestore = new Map<number, BlasSnap>();
+    preview.resetAllSprings();
     await recordWebM("Turntable", `aerie-turntable-${Date.now()}.webm`, W, H, frames, o.fps, (i) => {
+      const tSec = i / o.fps;
       cam.yaw = startYaw + (i / frames) * Math.PI * 2;
       cam.update();
+      preview.sampleAnimationAt(tSec);
+      let rebaked = false;
+      for (const inst of scene.instances) {
+        if (!preview.hasPlayingClip(inst.id) && !preview.hasSprings(inst.id)) continue;
+        if (bakeRigFrame(inst, null, shutter, bakeRestore)) rebaked = true;
+      }
+      if (rebaked) renderer.uploadMeshPools(scene); // re-uploads geometry (+ instances)
       // Animate emitters over the spin so fire/smoke live; motion-blur across 1/fps.
-      if (scene.emitters.length) uploadSceneParticles(i / o.fps, shutter);
+      if (scene.emitters.length) uploadSceneParticles(tSec, shutter);
       return renderer.renderToPixels(cam, W, H, o.samples);
     });
+    restoreBakedBlas(bakeRestore);
     cam.yaw = startYaw;
     cam.update();
     uploadedParticleTime = NaN; // force a re-freeze on the next live frame
@@ -1281,6 +1569,8 @@ async function main() {
   let cutsceneSel = -1;        // selected keyframe index
   let cutsceneTime = 0;        // playhead seconds
   let cutscenePlaying = false;
+  // Bumped whenever the keys change, to invalidate the keyed-skeleton cache.
+  let cutsceneKeysVersion = 0;
   let lastCutsceneSync = 0;    // throttle UI refresh during playback
 
   const normalizeCutscene = () => { if (cutsceneKeys.length) cutsceneKeys[0].duration = 0; };
@@ -1333,7 +1623,18 @@ async function main() {
     }
     for (const m of scene.instances) {
       csQuat.setFromEuler(m.rotation);
-      out.push({ id: m.id, pos: [m.position.x, m.position.y, m.position.z], quat: [csQuat.x, csQuat.y, csQuat.z, csQuat.w], scale: m.scale });
+      // Rigged instances also record their skeleton, so the shot animates at the
+      // joints. Bone order is the instance's skeleton order (stable per rig).
+      //
+      // But NOT when a clip owns the skeleton: a keyed pose is stamped over clip
+      // playback, so snapshotting one here would silently pin the rig to whatever
+      // frame it happened to be on — the model would travel along the shot while
+      // standing perfectly still. Keys carry a pose when YOU posed the rig.
+      const bones = preview.hasPlayingClip(m.id) ? null : preview.getBones(m.id);
+      const pose = bones?.map((b, i) => ({
+        i, q: [b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w] as [number, number, number, number],
+      }));
+      out.push({ id: m.id, pos: [m.position.x, m.position.y, m.position.z], quat: [csQuat.x, csQuat.y, csQuat.z, csQuat.w], scale: m.scale, pose });
     }
     for (const e of scene.emitters) {
       out.push({ id: e.id, pos: [e.position.x, e.position.y, e.position.z], quat: [0, 0, 0, 1], scale: 1 });
@@ -1349,6 +1650,7 @@ async function main() {
       timeOfDay: scene.world.timeOfDay, exposure: scene.world.exposure, haze: scene.world.hazeDensity,
       duration: cutsceneKeys.length === 0 ? 0 : 2,
       ease: "smooth",
+      bezier: [0.42, 0, 0.58, 1], // ease in-out by default (curve editor changes it)
       objects: captureObjects(),
     };
   }
@@ -1372,6 +1674,7 @@ async function main() {
   // Put objects + DoF + atmosphere back to their canonical (pre-cutscene) state.
   function restoreHome() {
     if (!cutsceneHome) return;
+    preview.clearPoseOverrides(); // stop driving skeletons from the timeline
     const byId = objectsById();
     for (const h of cutsceneHome.xforms) {
       const obj = byId.get(h.id);
@@ -1389,9 +1692,39 @@ async function main() {
   }
 
   // Pose the camera + DoF + atmosphere + tracked objects at timeline time `t`.
-  function applyCutsceneAt(t: number) {
+  // Returns the evaluated state so callers (e.g. the offline bake) can reuse it.
+  // Does the TIMELINE actually animate this rig's skeleton — i.e. do its keyed
+  // poses differ from one key to the next?
+  //
+  // Cutscenes captured before poses were made conditional (and any captured while
+  // a clip was paused) carry an identical skeleton snapshot in every key. Stamping
+  // that over a playing clip pins the rig mid-stride for the whole shot. If the
+  // poses never change, the timeline isn't posing anything, so a clip may drive.
+  // A rig you genuinely keyed pose-by-pose still wins, as it should.
+  const skeletonKeyedCache = new Map<number, boolean>();
+  let skeletonKeyedStamp = -1;
+  function timelineDrivesSkeleton(id: number): boolean {
+    if (skeletonKeyedStamp !== cutsceneKeysVersion) {
+      skeletonKeyedCache.clear();
+      skeletonKeyedStamp = cutsceneKeysVersion;
+    }
+    const hit = skeletonKeyedCache.get(id);
+    if (hit !== undefined) return hit;
+    const varies = poseVariesAcrossKeys(cutsceneKeys, id); // cached: it walks every bone of every key
+    skeletonKeyedCache.set(id, varies);
+    return varies;
+  }
+
+  /** The keyed pose to apply for an instance, or null to let its clip play. */
+  function effectiveKeyedPose(id: number, pose: BonePose[] | undefined): BonePose[] | null {
+    if (!pose) return null;
+    if (preview.hasPlayingClip(id) && !timelineDrivesSkeleton(id)) return null;
+    return pose;
+  }
+
+  function applyCutsceneAt(t: number): CamState | null {
     const s = evalCutscene(cutsceneKeys, t);
-    if (!s) return;
+    if (!s) return null;
     cam.target.set(s.target[0], s.target[1], s.target[2]);
     cam.distance = s.distance; cam.yaw = s.yaw; cam.pitch = s.pitch;
     cam.update();
@@ -1404,6 +1737,7 @@ async function main() {
     scene.world.hazeDensity = s.haze;
     if (s.objects && s.objects.length) {
       const byId = objectsById();
+      preview.clearPoseOverrides(); // rebuilt below for whatever is posed this frame
       for (const o of s.objects) {
         const obj = byId.get(o.id);
         if (!obj) continue;
@@ -1411,11 +1745,16 @@ async function main() {
         if (obj instanceof Emitter) continue; // emitters have no rotation/scale
         csQuat.set(o.quat[0], o.quat[1], o.quat[2], o.quat[3]);
         obj.rotation.setFromQuaternion(csQuat);
-        if (obj instanceof MeshInstance) obj.scale = o.scale;
+        if (obj instanceof MeshInstance) {
+          obj.scale = o.scale;
+          const keyed = effectiveKeyedPose(o.id, o.pose);
+          if (keyed) preview.setPoseOverride(o.id, keyed); // drive the skeleton
+        }
       }
       scene.touchInstances();
     }
     scene.touchWorld();
+    return s;
   }
 
   async function renderCutscene(o: TurntableOptions) {
@@ -1428,18 +1767,74 @@ async function main() {
     const H = Math.max(16, Math.round(W / aspect));
     const frames = Math.max(2, Math.round(total * o.fps));
     const shutter = 1 / o.fps;
+
+    // The ray tracer renders from the BLAS, not the live skeleton, so posed joints
+    // are baked into fresh geometry each frame. We snapshot the original BLAS (and
+    // its re-import link, which replaceBlas clears) to restore after the export, so
+    // exporting a video never mutates the scene. A dirty-check skips re-baking a
+    // rig whose pose is unchanged since its last bake (static segments).
+    type BlasSnap = { blas: BLAS; file: (typeof scene.blasFile)[number] };
+    const bakeRestore = new Map<number, BlasSnap>();
+    const lastPose = new Map<number, BonePose[]>();
+
+    const samePose = (a: BonePose[], b: BonePose[] | undefined): boolean => {
+      if (!b || a.length !== b.length) return false;
+      for (let k = 0; k < a.length; k++) {
+        if (a[k].i !== b[k].i) return false;
+        const p = a[k].q, q = b[k].q;
+        if (Math.abs(p[0] - q[0]) + Math.abs(p[1] - q[1]) + Math.abs(p[2] - q[2]) + Math.abs(p[3] - q[3]) > 1e-6) return false;
+      }
+      return true;
+    };
+
+    // Re-bake every rigged instance driven by a keyframe pose, a playing clip or
+    // spring bones at this frame; returns whether the mesh pools changed (and so
+    // need re-uploading).
+    const bakePosedFrame = (s: CamState): boolean => {
+      if (!s.objects) return false;
+      let any = false;
+      const byId = objectsById();
+      for (const o of s.objects) {
+        const obj = byId.get(o.id);
+        if (!(obj instanceof MeshInstance)) continue;
+        // Clips and springs both evolve every frame, so neither can be dirty-checked
+        // against the keyframe pose — they always re-bake.
+        const dynamic = preview.hasSprings(o.id) || preview.hasPlayingClip(o.id);
+        // A keyed pose only overrides clip playback when the timeline genuinely
+        // animates the joints; otherwise the sampled clip is what gets baked.
+        const keyed = effectiveKeyedPose(o.id, o.pose);
+        if (!keyed && !dynamic) continue;
+        if (!dynamic && samePose(keyed!, lastPose.get(o.id))) continue; // static pose → keep last bake
+        if (bakeRigFrame(obj, keyed, shutter, bakeRestore)) {
+          if (keyed) lastPose.set(o.id, keyed);
+          any = true;
+        }
+      }
+      return any;
+    };
+
+    preview.resetAllSprings(); // secondary motion starts settled, then accumulates over the shot
     await recordWebM("Cutscene", `aerie-cutscene-${Date.now()}.webm`, W, H, frames, o.fps, (i) => {
       const tSec = (total * i) / (frames - 1);
-      applyCutsceneAt(tSec);
+      const s = applyCutsceneAt(tSec);
+      // Put the clips at THIS frame's time before baking. Keyframed joint poses are
+      // stamped over the sampled clip inside the bake, so keys still beat playback.
+      preview.sampleAnimationAt(tSec);
       // The live loop is paused during export, so push the per-frame state into
       // the renderer ourselves: prims (scene), mesh instance matrices, and DoF.
+      const rebaked = s ? bakePosedFrame(s) : false;
       renderer.uploadScene(scene);
-      renderer.uploadInstances(scene);
+      if (rebaked) renderer.uploadMeshPools(scene); // re-uploads geometry (+ instances)
+      else renderer.uploadInstances(scene);
       renderer.uploadWorld(scene);
       // Emitters evaluated at this frame's cutscene time, motion-blurred over 1/fps.
       if (scene.emitters.length) uploadSceneParticles(tSec, shutter);
       return renderer.renderToPixels(cam, W, H, o.samples);
     });
+
+    // Put the original (un-posed) geometry and rig links back so the ray view isn't
+    // left frozen in the final frame's pose; the live loop re-uploads on the version bump.
+    restoreBakedBlas(bakeRestore);
     applyCutsceneAt(cutsceneTime); // return camera + DoF + objects to the playhead
     uploadedParticleTime = NaN; // force a re-freeze on the next live frame
   }
@@ -1462,7 +1857,12 @@ async function main() {
     time: () => cutsceneTime,
     duration: () => cutsceneDuration(cutsceneKeys),
     playing: () => cutscenePlaying,
-    keyInfo: (i: number) => ({ duration: cutsceneKeys[i].duration, ease: cutsceneKeys[i].ease, time: keyTime(cutsceneKeys, i) }),
+    keyInfo: (i: number) => ({
+      duration: cutsceneKeys[i].duration,
+      ease: cutsceneKeys[i].ease,
+      bezier: (cutsceneKeys[i].bezier ?? (cutsceneKeys[i].ease === "smooth" ? [0.42, 0, 0.58, 1] : [0, 0, 1, 1])).slice() as [number, number, number, number],
+      time: keyTime(cutsceneKeys, i),
+    }),
     keyAtmo: (i: number) => ({ timeOfDay: cutsceneKeys[i].timeOfDay, exposure: cutsceneKeys[i].exposure, haze: cutsceneKeys[i].haze }),
     // Edit an atmosphere field on a keyframe and preview it live at the playhead.
     setKeyAtmo: (i: number, field: "timeOfDay" | "exposure" | "haze", v: number) => {
@@ -1470,12 +1870,15 @@ async function main() {
       applyCutsceneAt(cutsceneTime);
       markDirty();
     },
-    add: () => { cutsceneKeys.push(captureKey()); normalizeCutscene(); cutsceneSel = cutsceneKeys.length - 1; cutsceneTime = keyTime(cutsceneKeys, cutsceneSel); markDirty(); ui.refresh(); },
-    remove: (i: number) => { cutsceneKeys.splice(i, 1); normalizeCutscene(); cutsceneSel = Math.min(cutsceneSel, cutsceneKeys.length - 1); markDirty(); ui.refresh(); },
-    recapture: (i: number) => { const k = captureKey(); k.duration = cutsceneKeys[i].duration; k.ease = cutsceneKeys[i].ease; cutsceneKeys[i] = k; normalizeCutscene(); markDirty(); ui.refresh(); },
+    add: () => { cutsceneKeys.push(captureKey()); cutsceneKeysVersion++; normalizeCutscene(); cutsceneSel = cutsceneKeys.length - 1; cutsceneTime = keyTime(cutsceneKeys, cutsceneSel); markDirty(); ui.refresh(); },
+    remove: (i: number) => { cutsceneKeys.splice(i, 1); cutsceneKeysVersion++; normalizeCutscene(); cutsceneSel = Math.min(cutsceneSel, cutsceneKeys.length - 1); markDirty(); ui.refresh(); },
+    recapture: (i: number) => { const k = captureKey(); k.duration = cutsceneKeys[i].duration; k.ease = cutsceneKeys[i].ease; k.bezier = cutsceneKeys[i].bezier; cutsceneKeys[i] = k; cutsceneKeysVersion++; normalizeCutscene(); markDirty(); ui.refresh(); },
     select: (i: number) => { cutsceneSel = i; cutsceneTime = keyTime(cutsceneKeys, i); applyCutsceneAt(cutsceneTime); ui.refresh(); },
     setDuration: (i: number, s: number) => { if (i > 0) { cutsceneKeys[i].duration = Math.max(0, s); markDirty(); } },
     setEase: (i: number, e: Ease) => { cutsceneKeys[i].ease = e; markDirty(); ui.refresh(); },
+    // Curve editor: set the segment's Bézier handles. No ui.refresh so dragging
+    // the handles stays smooth; the panel re-syncs on preset click / drag release.
+    setBezier: (i: number, b: [number, number, number, number]) => { cutsceneKeys[i].bezier = b; applyCutsceneAt(cutsceneTime); markDirty(); },
     scrub: (t: number) => { cutscenePlaying = false; cutsceneTime = t; applyCutsceneAt(t); },
     playPause: () => {
       if (cutsceneKeys.length < 2) return;
@@ -1532,8 +1935,58 @@ async function main() {
     boneNames: (inst) => preview.getBones(inst.id)?.map((b, i) => b.name || `bone ${i}`) ?? [],
     isPosing: () => poseInst !== null,
     onTogglePose: togglePose,
+    isIK: () => ikEnabled,
+    onToggleIK: () => { ikEnabled = !ikEnabled; },
+    animateInRender: () => animateInRender,
+    onToggleAnimateInRender: () => { animateInRender = !animateInRender; renderer.resetAccumulation(); },
+    selectedBoneCount: () => boneSel.size,
+    onClearBoneSelection: () => { boneSel.clear(); if (selectedBone >= 0) boneSel.add(selectedBone); },
+    hiddenBoneCount: () => (poseShowAll ? 0 : poseDeforms.reduce((n, d) => n + (d ? 0 : 1), 0)),
+    showAllBones: () => poseShowAll,
+    onToggleShowAllBones: () => { poseShowAll = !poseShowAll; },
+    isSpringBone: (i) => (poseInst ? preview.isSpringBone(poseInst.id, i) : false),
+    toggleSpringBone: (i) => { if (poseInst) preview.setSpringBone(poseInst.id, i, !preview.isSpringBone(poseInst.id, i)); },
+    hasSprings: () => (poseInst ? preview.hasSprings(poseInst.id) : false),
+    springParams: () => (poseInst ? preview.springParams(poseInst.id) : { stiffness: 0.2, damping: 0.2, gravity: 0.5 }),
+    setSpringParam: (key, v) => { if (poseInst) preview.setSpringParam(poseInst.id, key, v); },
+    clearSprings: () => { if (poseInst) preview.clearSprings(poseInst.id); },
+    clipNames: (inst) => preview.clipNames(inst.id),
+    onImportAnimation: async (inst, file) => {
+      hud.textContent = `Loading animation ${file.name}…`;
+      try {
+        const clips = await importAnimations(file);
+        const n = preview.addClips(inst.id, clips);
+        hud.textContent = n
+          ? `Added ${n} clip${n > 1 ? "s" : ""}. Open the Pose tab's clip list to scrub or blend them.`
+          : "No animation clips found in that file.";
+        ui.refresh();
+      } catch (e) {
+        hud.textContent = `Animation import failed: ${e instanceof Error ? e.message : e}`;
+      }
+    },
+    clipWeight: (inst, i) => preview.clipWeight(inst.id, i),
+    setClipWeight: (inst, i, w) => preview.setClipWeight(inst.id, i, w),
+    clipAdditive: (inst, i) => preview.clipAdditive(inst.id, i),
+    toggleClipAdditive: (inst, i) => preview.setClipAdditive(inst.id, i, !preview.clipAdditive(inst.id, i)),
+    poseClipIndex: () => (poseInst ? preview.activeClipIndex(poseInst.id) : -1),
+    poseClipDuration: () => (poseInst ? preview.activeClipDuration(poseInst.id) : 0),
+    poseClipTime: () => (poseInst ? preview.clipTime(poseInst.id) : 0),
+    onSelectClip: (i) => { if (poseInst) preview.setActiveClip(poseInst.id, i); },
+    onScrubClip: (t) => { if (poseInst) preview.scrubClip(poseInst.id, t); },
+    onSnapshotClip: () => { if (poseInst) preview.snapshotClipPose(poseInst.id); },
+    onPoseUndo: poseUndoStep,
+    onPoseRedo: poseRedoStep,
+    canPoseUndo: () => poseUndo.length > 0,
+    canPoseRedo: () => poseRedo.length > 0,
+    onCopyPose: copyPose,
+    onPastePose: pastePose,
+    canPastePose: () => !!poseInst && !!poseClipboard && poseClipboard.length === poseBones.length,
+    onResetAllJoints: resetAllJoints,
+    onSavePose: savePose,
+    poseLibraryNames: () => poseLibrary.map((p) => p.name),
+    onApplyLibraryPose: applyLibraryPose,
     poseSelectedBone: () => selectedBone,
-    onSelectBone: (i) => { selectedBone = i; },
+    onSelectBone: (i) => { selectedBone = i; boneSel.clear(); },
     boneRotation: (i) => {
       const b = poseBones[i];
       return b ? [b.rotation.x, b.rotation.y, b.rotation.z] : [0, 0, 0];
@@ -1679,7 +2132,7 @@ async function main() {
   // Left-drag empty space orbits; left-drag an object moves it (Shift = up/down).
   // Right-drag looks around in place (no camera move). Middle-drag pans the
   // camera across the horizontal plane. Wheel zooms.
-  type Drag = "none" | "pending" | "orbit" | "object" | "look" | "pan" | "axis" | "vert" | "bone" | "marquee";
+  type Drag = "none" | "pending" | "orbit" | "object" | "look" | "pan" | "axis" | "vert" | "bone" | "ik" | "multi" | "gzbone" | "marquee";
   let drag: Drag = "none";
   let lastX = 0;
   let lastY = 0;
@@ -1830,6 +2283,20 @@ async function main() {
     const y0 = Math.min(marqStartY, marqCurY), y1 = Math.max(marqStartY, marqCurY);
     const isClick = x1 - x0 < 4 && y1 - y0 < 4;
     const additive = e.shiftKey || e.ctrlKey;
+    if (poseInst) {
+      if (!additive) boneSel.clear();
+      let last = -1;
+      for (let i = 0; i < poseBones.length; i++) {
+        if (!boneOffered(i)) continue;
+        if (!inMarquee(poseBones[i].getWorldPosition(boneWorld), x0, y0, x1, y1)) continue;
+        boneSel.add(i);
+        last = i;
+      }
+      if (last >= 0) selectedBone = last;
+      else if (!additive && selectedBone >= 0) boneSel.add(selectedBone); // never empty
+      ui.refresh();
+      return;
+    }
     if (editInstance && editMesh) {
       if (isClick) clickSelectVertex(e, additive);
       else boxSelectVerts(x0, y0, x1, y1, additive);
@@ -1931,8 +2398,58 @@ async function main() {
 
       if (editInstance) { editPointerDown(e); return; } // vertex editing
       if (poseInst) {
+        // FK: grab a rotation ring of the selected bone before falling to joints.
+        if (!ikEnabled && selectedBone >= 0) {
+          const axis = pickBoneRing(e.clientX, e.clientY, selectedBone);
+          if (axis >= 0) { poseDragSnap = capturePose(); beginBoneGizmo(axis, e); return; }
+        }
         const bi = pickBone(e.clientX, e.clientY);
-        if (bi >= 0) { selectedBone = bi; ui.refresh(); drag = "bone"; return; } // click+drag rotates
+        if (bi >= 0) {
+          // Ctrl-click builds the selection instead of starting a drag.
+          if (e.ctrlKey || e.metaKey) {
+            if (boneSel.has(bi) && bi !== selectedBone) boneSel.delete(bi);
+            else { boneSel.add(bi); selectedBone = bi; }
+            boneSel.add(selectedBone); // the active joint is always part of it
+            ui.refresh();
+            return;
+          }
+          // Grabbing a joint that's in a multi-selection drags the whole set;
+          // grabbing anything else collapses the selection onto it.
+          if (!boneSel.has(bi)) { boneSel.clear(); boneSel.add(bi); }
+          selectedBone = bi;
+          ui.refresh();
+          if (boneSel.size > 1 && ikEnabled && beginMultiDrag(e)) return;
+          const chain = ikEnabled ? ikChain(bi, e.shiftKey) : [];
+          if (chain.length >= 2) {
+            // Grab the effector: solve the chain as the cursor drags it, on a
+            // camera-facing plane at the effector's depth.
+            poseDragSnap = capturePose(); // pre-edit pose → one undo step on release
+            const tip = chain[chain.length - 1];
+            tip.getWorldPosition(ikPlanePoint);
+            if (chain.length === 3) {
+              // Exact two-bone solve for a shoulder/elbow/wrist-style limb.
+              ikChainArr = null;
+              ikRoot = chain[0]; ikMid = chain[1]; ikTip = chain[2];
+              autoPole(ikRoot, ikMid, ikTip, ikPole);
+            } else {
+              // CCD for any other chain length — tails, tentacles, spines.
+              ikChainArr = chain;
+              ikRoot = ikMid = ikTip = null;
+            }
+            drag = "ik";
+          } else {
+            drag = "bone"; // no usable chain, or IK off → FK arcball rotate
+          }
+          return;
+        }
+        // Empty space: rubber-band over joints with the Box-Select tool, else orbit.
+        if (tool === "select") {
+          marqStartX = marqCurX = e.clientX;
+          marqStartY = marqCurY = e.clientY;
+          drag = "marquee";
+          return;
+        }
+        if (!(e.ctrlKey || e.metaKey)) { boneSel.clear(); boneSel.add(selectedBone); }
         drag = "orbit"; // empty space → orbit the camera
         return;
       }
@@ -2017,7 +2534,15 @@ async function main() {
       });
     });
     c.addEventListener("pointerup", (e) => {
-      if (drag === "object" || drag === "axis" || drag === "bone") ui.refresh(); // sync inspector fields
+      if (drag === "object" || drag === "axis" || drag === "bone" || drag === "ik" || drag === "multi" || drag === "gzbone") ui.refresh(); // sync inspector fields
+      if (drag === "ik") { ikRoot = ikMid = ikTip = null; ikChainArr = null; }
+      if (drag === "multi") multiGrab = [];
+      if (drag === "gzbone") { gzAxis = -1; }
+      // Commit a joint edit as one pose-undo step (only if it actually moved).
+      if ((drag === "ik" || drag === "multi" || drag === "gzbone" || drag === "bone") && poseDragSnap) {
+        if (posesDiffer(poseDragSnap, capturePose())) pushPoseUndo(poseDragSnap);
+        poseDragSnap = null;
+      }
       if ((drag === "object" || drag === "axis") && movedDuringDrag) history.commit();
       if (drag === "vert" && vertDragMode !== "none") commitEdit(); // rebuild BLAS
       if (drag === "marquee") resolveMarquee(e);
@@ -2032,7 +2557,27 @@ async function main() {
     c.addEventListener("pointermove", (e) => {
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
-      if (drag === "bone" && poseInst && selectedBone >= 0) {
+      if (drag === "gzbone") {
+        dragBoneGizmo(e);
+        lastX = e.clientX;
+        lastY = e.clientY;
+      } else if (drag === "ik") {
+        // Solve the grabbed chain so its tip chases the cursor across a camera-
+        // facing plane at the tip's depth. Exact two-bone when we have a limb;
+        // CCD for longer chains (tails/tentacles). The pole holds the elbow bend.
+        const ray = screenRay(e.clientX, e.clientY);
+        const hit = rayPlane(ray.ro, ray.rd, ikPlanePoint, cam.forward);
+        if (hit) {
+          if (ikRoot && ikMid && ikTip) solveTwoBoneIK(ikRoot, ikMid, ikTip, hit, { pole: ikPole });
+          else if (ikChainArr) solveCCD(ikChainArr, hit, { iterations: 12, damping: 0.5 });
+        }
+        lastX = e.clientX;
+        lastY = e.clientY;
+      } else if (drag === "multi") {
+        dragMulti(e);
+        lastX = e.clientX;
+        lastY = e.clientY;
+      } else if (drag === "bone" && poseInst && selectedBone >= 0) {
         // Arcball: rotate the selected bone around the camera's screen axes.
         const b = poseBones[selectedBone];
         const k = 0.012; // radians per pixel
@@ -2102,8 +2647,20 @@ async function main() {
           else groupDelta.y = 0;
           applyTranslate();
         }
+      } else if (poseInst && drag === "none") {
+        // Idle in pose mode: track the joint under the cursor so the overlay can
+        // show what a drag from here would move, before you commit to it.
+        hoverBone = pickBone(e.clientX, e.clientY);
+        hoverExtend = e.shiftKey;
+        canvas.style.cursor = hoverBone >= 0 ? "grab" : "";
       }
     });
+    c.addEventListener("pointerleave", () => { hoverBone = -1; });
+    // Shift extends the chain — reflect it in the hover preview even if the
+    // cursor is holding still.
+    const trackShift = (e: KeyboardEvent) => { if (poseInst && drag === "none") hoverExtend = e.shiftKey; };
+    window.addEventListener("keydown", trackShift);
+    window.addEventListener("keyup", trackShift);
     c.addEventListener(
       "wheel",
       (e) => {
@@ -2259,13 +2816,15 @@ async function main() {
     rotateMod = e.ctrlKey || e.shiftKey;
     if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) {
       e.preventDefault();
-      if (editInstance || poseInst) return; // don't rewrite the scene mid-edit
+      if (poseInst) { if (e.shiftKey) poseRedoStep(); else poseUndoStep(); return; } // pose-local undo
+      if (editInstance) return; // don't rewrite the scene mid-edit
       if (e.shiftKey) history.redo(); else history.undo();
       return;
     }
     if ((e.ctrlKey || e.metaKey) && (e.key === "y" || e.key === "Y")) {
       e.preventDefault();
-      if (editInstance || poseInst) return;
+      if (poseInst) { poseRedoStep(); return; }
+      if (editInstance) return;
       history.redo();
       return;
     }
@@ -2596,49 +3155,322 @@ async function main() {
     octx.restore();
   }
 
+  // ---- what a joint drag moves ----
+  // Grabbing a joint drags it to the cursor; everything hanging off it (the rest
+  // of the arm, the hand, the fingers) rides along rigidly, because they're its
+  // children. How far UP the edit is felt comes from the skeleton's own shape --
+  // see `mesh/poseChain` -- so there's no "reach" dial to set before you drag.
+  const ikChain = (effIdx: number, extend = false) => poseIkChain(poseBones, effIdx, extend);
+
+  // ---- moving several joints at once ----
+  // Each selected joint keeps its own chain and is solved toward its own start
+  // position plus the cursor's travel, so the selection moves as a formation
+  // rather than collapsing onto one point. Joints are solved shallowest-first:
+  // when a selection contains both ends of a limb, the upper solve runs before
+  // the lower one corrects on top of it.
+
+  /** Depth of a bone in the skeleton, for solve ordering. */
+  function boneDepth(b: Object3D, set: Set<Object3D>): number {
+    let d = 0;
+    for (let p = b.parent; p && set.has(p); p = p.parent) d++;
+    return d;
+  }
+
+  function beginMultiDrag(e: PointerEvent): boolean {
+    const set = new Set(poseBones);
+    const grabs: MultiGrab[] = [];
+    for (const i of boneSel) {
+      const bone = poseBones[i];
+      if (!bone) continue;
+      const chain = ikChain(i, e.shiftKey);
+      if (chain.length < 2) continue; // nothing to solve this one with
+      const pole = chain.length === 3 ? autoPole(chain[0], chain[1], chain[2], new Vector3()) : null;
+      grabs.push({ bone, start: bone.getWorldPosition(new Vector3()), chain, pole, depth: boneDepth(bone, set) });
+    }
+    if (grabs.length < 2) return false; // fall through to the single-joint drag
+    grabs.sort((a, b) => a.depth - b.depth);
+    // Drag plane faces the camera through the joint that was actually grabbed.
+    poseBones[selectedBone].getWorldPosition(ikPlanePoint);
+    const ray = screenRay(e.clientX, e.clientY);
+    const hit = rayPlane(ray.ro, ray.rd, ikPlanePoint, cam.forward);
+    if (!hit) return false;
+    multiHit0.copy(hit);
+    multiGrab = grabs;
+    poseDragSnap = capturePose(); // whole group edit = one undo step
+    drag = "multi";
+    return true;
+  }
+
+  const multiTarget = new Vector3();
+  function dragMulti(e: PointerEvent): void {
+    const ray = screenRay(e.clientX, e.clientY);
+    const hit = rayPlane(ray.ro, ray.rd, ikPlanePoint, cam.forward);
+    if (!hit) return;
+    hit.sub(multiHit0); // world-space travel since the grab
+    for (const g of multiGrab) {
+      multiTarget.copy(g.start).add(hit);
+      if (g.chain.length === 3 && g.pole) {
+        solveTwoBoneIK(g.chain[0], g.chain[1], g.chain[2], multiTarget, { pole: g.pole });
+      } else {
+        solveCCD(g.chain, multiTarget, { iterations: 8, damping: 0.5 });
+      }
+    }
+  }
+
   // Skeleton overlay: bone lines + clickable joints.
   const boneWorld = new Vector3();
+  const PICK_RADIUS = 16; // screen px a joint dot answers to
+  const PICK_TIE = 6;     // dots this close to the best are treated as overlapping
+  /**
+   * The joint under the cursor, or -1. Where dots overlap — fingers, the spine
+   * seen edge-on — the nearest one to the CAMERA wins rather than whichever
+   * happens to be a pixel closer to the cursor, so you grab the joint you can
+   * actually see.
+   */
   function pickBone(cx: number, cy: number): number {
     let best = -1;
-    let bestD = 13;
+    let bestD = PICK_RADIUS;
+    let bestZ = Infinity;
     for (let i = 0; i < poseBones.length; i++) {
-      const s = projectToScreen(poseBones[i].getWorldPosition(boneWorld));
+      if (!boneOffered(i)) continue; // helper bones aren't grabbable
+      poseBones[i].getWorldPosition(boneWorld);
+      const s = projectToScreen(boneWorld);
       if (!s) continue;
       const d = Math.hypot(cx - s.x, cy - s.y);
-      if (d < bestD) { bestD = d; best = i; }
+      if (d >= PICK_RADIUS) continue;
+      const z = boneWorld.sub(cam.position).dot(cam.forward); // depth along the view axis
+      if (best < 0 || d < bestD - PICK_TIE || (d < bestD + PICK_TIE && z < bestZ)) {
+        if (d < bestD) bestD = d;
+        bestZ = z;
+        best = i;
+      }
     }
     return best;
   }
+
+  // ---- FK rotation-ring gizmo ----
+  // A bone's local axis `k` expressed in world space (unit) → `out`.
+  function worldBoneAxis(bone: Object3D, k: number, out: Vector3): Vector3 {
+    bone.getWorldQuaternion(gzBoneWQ);
+    return out.copy(gzUnit[k]).applyQuaternion(gzBoneWQ).normalize();
+  }
+  // Orthonormal basis (u, v) of the plane ⟂ `n`, with u × v = n.
+  function ringBasis(n: Vector3, u: Vector3, v: Vector3): void {
+    u.set(0, 1, 0);
+    if (Math.abs(n.y) > 0.9) u.set(1, 0, 0);
+    u.cross(n).normalize();
+    v.copy(n).cross(u).normalize();
+  }
+  // World radius that projects to a roughly constant on-screen ring size.
+  function ringRadius(center: Vector3): number {
+    const z = gzHit.copy(center).sub(cam.position).dot(cam.forward);
+    return (46 * Math.max(z, 0.1) * cam.fovScale * 2) / Math.max(1, overlay.height);
+  }
+  // Signed angle of a world point around the current drag plane (origin = gzRefU).
+  function ringAngle(hit: Vector3): number {
+    gzTmpU.copy(hit).sub(gzCenter);
+    const x = gzTmpU.dot(gzRefU);
+    gzTmpV.copy(gzAxisWorld).cross(gzRefU); // second in-plane basis vector
+    return Math.atan2(gzTmpU.dot(gzTmpV), x);
+  }
+  // Which rotation ring (0/1/2) of `boneIdx` is under the cursor, or -1.
+  function pickBoneRing(cx: number, cy: number, boneIdx: number): number {
+    const bone = poseBones[boneIdx];
+    if (!bone) return -1;
+    bone.getWorldPosition(gzCenter);
+    const R = ringRadius(gzCenter);
+    let best = -1, bestD = 8;
+    for (let k = 0; k < 3; k++) {
+      worldBoneAxis(bone, k, gzN);
+      ringBasis(gzN, gzTmpU, gzTmpV);
+      for (let a = 0; a < 48; a++) {
+        const th = (a / 48) * Math.PI * 2;
+        gzHit.copy(gzCenter).addScaledVector(gzTmpU, Math.cos(th) * R).addScaledVector(gzTmpV, Math.sin(th) * R);
+        const s = projectToScreen(gzHit);
+        if (!s) continue;
+        const d = Math.hypot(cx - s.x, cy - s.y);
+        if (d < bestD) { bestD = d; best = k; }
+      }
+    }
+    return best;
+  }
+  function beginBoneGizmo(axis: number, e: PointerEvent): void {
+    const bone = poseBones[selectedBone];
+    if (!bone) return;
+    gzAxis = axis;
+    gzStartQuat.copy(bone.quaternion);
+    // A multi-selection turns together: every selected joint takes the same
+    // rotation about its OWN local axis, from its own starting orientation, so
+    // e.g. all the finger joints curl by the same amount at once.
+    gzGroup = [...boneSel]
+      .filter((i) => i !== selectedBone && poseBones[i])
+      .map((i) => ({ bone: poseBones[i], start: poseBones[i].quaternion.clone() }));
+    bone.getWorldPosition(gzCenter);
+    worldBoneAxis(bone, axis, gzAxisWorld);
+    ringBasis(gzAxisWorld, gzRefU, gzTmpV); // gzRefU = angle origin in the plane
+    const ray = screenRay(e.clientX, e.clientY);
+    const hit = rayPlane(ray.ro, ray.rd, gzCenter, gzAxisWorld);
+    gzPrevAngle = hit ? ringAngle(hit) : 0;
+    gzAccum = 0;
+    drag = "gzbone";
+  }
+  function dragBoneGizmo(e: PointerEvent): void {
+    const bone = poseBones[selectedBone];
+    if (!bone) return;
+    const ray = screenRay(e.clientX, e.clientY);
+    const hit = rayPlane(ray.ro, ray.rd, gzCenter, gzAxisWorld);
+    if (!hit) return;
+    // Unwrap: accumulate the shortest step each move so sweeps past ±180° don't flip.
+    const a = ringAngle(hit);
+    let step = a - gzPrevAngle;
+    if (step > Math.PI) step -= 2 * Math.PI;
+    if (step < -Math.PI) step += 2 * Math.PI;
+    gzAccum += step;
+    gzPrevAngle = a;
+    let delta = gzAccum;
+    if (snapEnabled) { const s = Math.PI / 12; delta = Math.round(delta / s) * s; } // 15°
+    gzQ.setFromAxisAngle(gzUnit[gzAxis], delta);
+    bone.quaternion.copy(gzStartQuat).multiply(gzQ).normalize();
+    for (const g of gzGroup) g.bone.quaternion.copy(g.start).multiply(gzQ).normalize();
+  }
+  function drawBoneGizmo(boneIdx: number): void {
+    const bone = poseBones[boneIdx];
+    if (!bone) return;
+    bone.getWorldPosition(gzCenter);
+    const R = ringRadius(gzCenter);
+    const active = drag === "gzbone";
+    for (let k = 0; k < 3; k++) {
+      worldBoneAxis(bone, k, gzN);
+      ringBasis(gzN, gzTmpU, gzTmpV);
+      octx.strokeStyle = AXIS_COLORS[k];
+      octx.lineWidth = active && gzAxis === k ? 3 : 1.5;
+      octx.globalAlpha = active && gzAxis !== k ? 0.3 : 0.9;
+      octx.beginPath();
+      let started = false;
+      for (let a = 0; a <= 48; a++) {
+        const th = (a / 48) * Math.PI * 2;
+        gzHit.copy(gzCenter).addScaledVector(gzTmpU, Math.cos(th) * R).addScaledVector(gzTmpV, Math.sin(th) * R);
+        const s = projectToScreen(gzHit);
+        if (!s) { started = false; continue; }
+        if (!started) { octx.moveTo(s.x, s.y); started = true; } else octx.lineTo(s.x, s.y);
+      }
+      octx.stroke();
+    }
+    octx.globalAlpha = 1;
+  }
+
+  /**
+   * What a drag on `idx` would move, for the hover preview: the bones that will
+   * be SOLVED (rotated), the subtree that RIDES along rigidly, and the joint that
+   * stays put and acts as the pivot.
+   */
+  function dragAffects(idx: number, extend: boolean): { solved: Set<Object3D>; riding: Set<Object3D>; pivot: Object3D | null } {
+    const set = new Set(poseBones);
+    const solved = new Set<Object3D>();
+    const riding = boneSubtree(poseBones[idx], set, new Set<Object3D>());
+    let pivot: Object3D | null = null;
+    if (ikEnabled) {
+      const chain = ikChain(idx, extend);
+      if (chain.length >= 2) {
+        pivot = chain[0];
+        for (let k = 1; k < chain.length; k++) solved.add(chain[k]); // segments that swing
+      }
+    }
+    if (!pivot) pivot = poseBones[idx]; // FK / no chain: the joint rotates in place
+    return { solved, riding, pivot };
+  }
+
+  // The hover preview is recomputed only when the grab it describes changes —
+  // on a 1082-bone rig, rebuilding the bone sets every frame is real work.
+  let affectCache: { key: string; value: ReturnType<typeof dragAffects> } | null = null;
+  function hoverAffect(): ReturnType<typeof dragAffects> | null {
+    if (drag !== "none" || hoverBone < 0) return null;
+    const key = `${hoverBone}:${hoverExtend}:${ikEnabled}`;
+    if (affectCache?.key !== key) affectCache = { key, value: dragAffects(hoverBone, hoverExtend) };
+    return affectCache.value;
+  }
+
   function drawPose() {
     if (!poseInst || poseBones.length === 0) return;
     const boneSet = new Set(poseBones);
-    octx.strokeStyle = "rgba(120,220,160,0.55)";
-    octx.lineWidth = 1.5;
-    for (const b of poseBones) {
-      if (!b.parent || !boneSet.has(b.parent)) continue;
+    // Preview of the pending edit: which bones this grab would move, and where it
+    // stops. Only while idle — during a drag you can see the real thing.
+    const affect = hoverAffect();
+
+    const boneIdx = new Map<Object3D, number>(poseBones.map((b, i) => [b, i]));
+    for (let i = 0; i < poseBones.length; i++) {
+      if (!boneOffered(i)) continue;
+      const b = poseBones[i];
+      // Draw to the nearest offered ancestor, so hiding helper bones doesn't
+      // leave gaps in the skeleton.
+      let par = b.parent;
+      while (par && boneSet.has(par) && !boneOffered(boneIdx.get(par) ?? -1)) par = par.parent;
+      if (!par || !boneSet.has(par)) continue;
       const a = projectToScreen(b.getWorldPosition(boneWorld));
-      const c = projectToScreen(b.parent.getWorldPosition(boneWorld));
+      const c = projectToScreen(par.getWorldPosition(boneWorld));
       if (!a || !c) continue;
+      // Amber = solved by the drag, cyan = riding along rigidly, green = unaffected.
+      const solved = affect?.solved.has(b);
+      const riding = affect?.riding.has(b);
+      octx.strokeStyle = solved ? "rgba(255,200,90,0.95)"
+        : riding ? "rgba(120,210,255,0.85)"
+        : affect ? "rgba(120,220,160,0.25)" // dim the rest so the affected part reads
+        : "rgba(120,220,160,0.55)";
+      octx.lineWidth = solved || riding ? 2.5 : 1.5;
       octx.beginPath(); octx.moveTo(a.x, a.y); octx.lineTo(c.x, c.y); octx.stroke();
     }
+    octx.lineWidth = 1.5;
     for (let i = 0; i < poseBones.length; i++) {
+      if (!boneOffered(i)) continue;
       const s = projectToScreen(poseBones[i].getWorldPosition(boneWorld));
       if (!s) continue;
       const on = i === selectedBone;
-      octx.fillStyle = on ? "#ffe680" : "rgba(150,235,180,0.95)";
+      const inSel = boneSel.size > 1 && boneSel.has(i);
+      const hot = i === hoverBone && affect !== null;
+      octx.fillStyle = hot ? "#ffffff" : on ? "#ffe680" : inSel ? "#ffc14d" : "rgba(150,235,180,0.95)";
       octx.beginPath();
-      octx.arc(s.x, s.y, on ? 5.5 : 3.5, 0, Math.PI * 2);
+      octx.arc(s.x, s.y, hot ? 6.5 : on || inSel ? 5.5 : 3.5, 0, Math.PI * 2);
       octx.fill();
+      if (inSel && !on) { // ring the co-selected joints so the set is readable
+        octx.strokeStyle = "rgba(255,225,150,0.9)";
+        octx.beginPath(); octx.arc(s.x, s.y, 8, 0, Math.PI * 2); octx.stroke();
+      }
     }
+    // The joint the edit pivots around — everything above it holds still.
+    if (affect?.pivot) {
+      const p = projectToScreen(affect.pivot.getWorldPosition(boneWorld));
+      if (p) {
+        octx.strokeStyle = "rgba(255,255,255,0.9)";
+        octx.beginPath(); octx.arc(p.x, p.y, 8, 0, Math.PI * 2); octx.stroke();
+        octx.beginPath(); octx.arc(p.x, p.y, 2, 0, Math.PI * 2); octx.stroke();
+      }
+    }
+    // FK: the rotation-ring gizmo on the selected joint (X/Y/Z, quaternion rotate).
+    if (!ikEnabled && selectedBone >= 0) drawBoneGizmo(selectedBone);
     octx.fillStyle = "rgba(255,255,255,0.85)";
     octx.font = "12px ui-monospace, monospace";
-    octx.fillText("POSE MODE · click+drag a joint to rotate it", 12, overlay.height - 16);
+    // Name the joint under the cursor — on a rig with hundreds of bones you
+    // otherwise can't tell an elbow from the twist helper sitting on top of it.
+    if (hoverBone >= 0) {
+      const b = poseBones[hoverBone];
+      const s = projectToScreen(b.getWorldPosition(boneWorld));
+      if (s) octx.fillText(b.name || `bone ${hoverBone}`, s.x + 10, s.y - 8);
+    }
+    const hint = boneSel.size > 1
+      ? `${boneSel.size} joints selected — drag any of them to move the set${ikEnabled ? "" : " · the rings turn them all"}`
+      : !ikEnabled
+      ? "POSE MODE · drag the X/Y/Z rings to rotate the joint · Shift snaps 15°"
+      : affect
+      ? "amber = bends · blue = follows · ○ = holds still · Shift reaches one bone further"
+      : "POSE MODE · drag any joint — what's below it follows · Ctrl-click to select several";
+    const hidden = poseShowAll ? 0 : poseDeforms.reduce((n, d) => n + (d ? 0 : 1), 0);
+    octx.fillText(hidden ? `${hint} · ${hidden} helper joints hidden` : hint, 12, overlay.height - 16);
   }
 
   function drawGizmo() {
     octx.clearRect(0, 0, overlay.width, overlay.height);
     if (editInstance && editMesh) { drawEditOverlay(); drawMarquee(); return; }
-    if (poseInst) { drawPose(); return; }
+    if (poseInst) { drawPose(); drawMarquee(); return; }
     drawCarverGhosts();
     drawLightMarkers();
     drawEmitterMarkers();
@@ -2937,6 +3769,10 @@ async function main() {
       return;
     }
 
+    // The ray tracer draws from baked geometry, not the live skeleton, so a rig
+    // only moves here if we step it and re-bake it each frame.
+    const rebaked = stepRenderAnimation();
+
     if (renderer.frame < MAX_SAMPLES) renderer.renderSample(cam);
     drawGizmo();
 
@@ -2945,7 +3781,7 @@ async function main() {
 
     const done = renderer.frame >= MAX_SAMPLES;
     hud.textContent =
-      `Aerie · Render (ray-traced)\n` +
+      `Aerie · Render (ray-traced)${rebaked ? " · animating (1 sample/frame)" : ""}\n` +
       `${renderer.width}×${renderer.height} · ${Math.min(renderer.frame, MAX_SAMPLES)}/${MAX_SAMPLES}` +
       `${done ? " ✓" : ""} · ${fps.toFixed(0)} fps` +
       `${scene.instances.length ? ` · ${scene.instances.length} model(s)` : ""}\n` +
