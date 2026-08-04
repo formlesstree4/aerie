@@ -35,6 +35,19 @@ function fail(msg: string): never {
 
 async function main() {
   if (!navigator.gpu) {
+    // navigator.gpu is only exposed in a secure context: HTTPS, or plain HTTP
+    // on localhost/127.0.0.1. Serving the container over http://<lan-ip>:8080
+    // hides the API no matter how well the browser supports WebGPU, so call
+    // that case out instead of blaming the browser.
+    if (!window.isSecureContext) {
+      fail(
+        `WebGPU is hidden because this page is not a secure context (${location.origin}).\n\n` +
+          "Browsers only expose navigator.gpu over HTTPS, or over plain HTTP on " +
+          "localhost / 127.0.0.1.\n\n" +
+          "Fixes: open the app at http://localhost:8080, tunnel the port to your " +
+          "machine, or serve it over HTTPS.",
+      );
+    }
     fail(
       "WebGPU is not available in this browser.\n\n" +
         "Use a recent Chrome/Edge (or Firefox Nightly with WebGPU enabled), " +

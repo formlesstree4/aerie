@@ -7,6 +7,16 @@ services:
     container_name: aerie
     ports:
       - "8080:80"
+      - "8443:443"
+    environment:
+      # Names and IPs this box is reached by, so the generated certificate
+      # carries matching SANs. localhost/127.0.0.1 are always included.
+      # e.g. AERIE_TLS_HOSTS=aerie.lan,192.168.1.50
+      AERIE_TLS_HOSTS: ${AERIE_TLS_HOSTS:-}
+    volumes:
+      # Keeps the self-signed certificate across recreates, so you only have to
+      # trust it in the browser once.
+      - ./certs:/etc/nginx/certs
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]

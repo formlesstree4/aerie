@@ -115,6 +115,59 @@ npm run build
 npm run preview
 ```
 
+## Docker
+
+```bash
+docker compose up -d --build     # http://localhost:8080, https://localhost:8443
+```
+
+### WebGPU needs a secure context
+
+Browsers only expose `navigator.gpu` on a **secure origin**: HTTPS, or plain
+HTTP on `localhost`/`127.0.0.1`. Reaching the container at
+`http://192.168.1.50:8080` hides WebGPU entirely and Aerie shows the
+"not a secure context" error — no browser setting will fix it. Browsing from
+the Docker host itself over `http://localhost:8080` is fine.
+
+For everything else use the HTTPS port. The container generates a self-signed
+certificate on first start, so there is nothing to do but tell it what names
+you reach the box by:
+
+```bash
+AERIE_TLS_HOSTS=aerie.lan,192.168.1.50 docker compose up -d --build
+```
+
+Those become the certificate's SANs (`localhost` and `127.0.0.1` are always
+included). The cert lands in `./certs/`, which is mounted into the container, so
+it survives recreates and only has to be trusted once. Delete `./certs/` and
+restart to mint a fresh one — do that if you change `AERIE_TLS_HOSTS`, since an
+existing cert is reused as-is.
+
+Already have a real certificate (Let's Encrypt, an internal CA)? Drop it in as
+`certs/aerie.crt` + `certs/aerie.key` and the generator steps aside.
+
+### Trusting the self-signed cert
+
+The browser will warn on first visit because nothing vouches for the cert. Either
+click through (**Advanced → Proceed**, per browser, and it sticks), or install it
+so the warning stops for good:
+
+```bash
+docker compose cp aerie:/etc/nginx/certs/aerie.crt ./aerie.crt   # or just use ./certs/aerie.crt
+```
+
+- **Windows** — `Import-Certificate -FilePath .\aerie.crt -CertStoreLocation Cert:\CurrentUser\Root`
+  (elevated PowerShell), then restart the browser. Chrome, Edge, and Brave use
+  this store; Firefox does not.
+- **Firefox / Firefox Nightly** — Settings → Privacy & Security → Certificates →
+  *View Certificates* → **Servers** → *Import*, or just accept the warning.
+- **macOS** — `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain aerie.crt`
+- **Linux** — copy to `/usr/local/share/ca-certificates/aerie.crt`, then
+  `sudo update-ca-certificates` (Chrome also reads its own NSS store via
+  `certutil -d sql:$HOME/.pki/nssdb -A -t "P,," -n aerie -i aerie.crt`).
+
+The certificate is valid for 825 days, so re-mint it before then.
+
 ## Controls
 
 - **Click** an object to select it; **drag** to move it on the ground (Shift =
