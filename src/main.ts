@@ -89,7 +89,11 @@ async function main() {
   // scene.version at the last save / load / new — used to detect unsaved changes.
   let savedVersion = scene.version;
 
-  let mode: "render" | "preview" = "render";
+  // Start in the raster preview. Kicking off the path tracer on the very first
+  // frame — while models, textures, and BLAS uploads are still landing — has
+  // been enough to lose the device on some GPUs. The tracer stays idle (the
+  // frame loop returns early in preview) until the user toggles into Render.
+  let mode: "render" | "preview" = "preview";
   const applyMode = () => preview.setActive(mode === "preview");
   let showCarverGhosts = false; // draw negative (carve) prims as wireframe cages
   let focusPick = false; // armed by the Render lab: next viewport click sets DoF focus

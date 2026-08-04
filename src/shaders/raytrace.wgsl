@@ -16,7 +16,7 @@ struct Uniforms {
   pickX     : f32,  pickY       : f32, _pad3 : f32, _pad4 : f32,
   sunColor  : vec3f, starsFlag  : f32,
   aperture  : f32,  focusDist   : f32, giBounces : f32, shaftStr : f32,  // thin-lens DoF; giBounces = indirect diffuse bounces; shaftStr = god-ray strength
-  partCount : f32,  shutter     : f32, _p0 : f32, _p1 : f32,  // particle count; shutter = motion-blur time (1/fps, 0 = none)
+  partCount : f32,  shutter     : f32, tileY0 : f32, tileY1 : f32,  // particle count; shutter = motion-blur time (1/fps, 0 = none); [tileY0,tileY1) = scanline band this dispatch covers
   partBound : vec3f, partRadius : f32,  // bounding sphere over all live particles (whole-cloud ray reject)
 };
 
@@ -1453,8 +1453,11 @@ fn trace(ro0: vec3f, rd0: vec3f) -> vec3f {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
-  let px = gid.xy;
-  if (f32(px.x) >= u.res.x || f32(px.y) >= u.res.y) { return; }
+  // WebGPU has no dispatch base offset, so a banded dispatch shifts y here.
+  // tileY1 is the band's exclusive end row (== res.y for a whole-frame pass),
+  // which also serves as the vertical bounds check.
+  let px = vec2u(gid.x, gid.y + u32(u.tileY0));
+  if (f32(px.x) >= u.res.x || f32(px.y) >= u.tileY1) { return; }
   seedRng(px);
 
   let jitter = vec2f(rand(), rand()) - 0.5;

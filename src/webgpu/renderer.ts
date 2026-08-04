@@ -13,6 +13,11 @@ const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 const PRIM_BYTES = MAX_PRIMS * 36 * 4;
 const LIGHT_BYTES = MAX_LIGHTS * LIGHT_FLOATS * 4;
 const PARTICLE_BYTES = MAX_PARTICLES * PARTICLE_FLOATS * 4;
+// Target pixels per dispatch when banding the first sample. ~1M keeps a single
+// dispatch comfortably inside the ~2s watchdog window even on a slow iGPU
+// tracing a cold scene, while staying coarse enough that the extra submissions
+// cost nothing measurable.
+const WARMUP_BAND_PIXELS = 1 << 20;
 
 export class Renderer {
   private accumBuffer!: GPUBuffer;
@@ -41,6 +46,14 @@ export class Renderer {
   private pickRead: GPUBuffer;
   private pickX = -1;
   private pickY = -1;
+  // Scanline band the next dispatch covers. tileY1 = 0 means "the whole frame",
+  // which is what every path except a banded first sample wants.
+  private tileY0 = 0;
+  private tileY1 = 0;
+  // Time and RNG seed pinned across the bands of one sample so the strips agree
+  // on the instant they're sampling; -1 = not pinned (use live values).
+  private frozenClock = -1;
+  private frozenSeed = -1;
   private worldBuffer: GPUBuffer;
   private particleBuffer: GPUBuffer;
   private particleCount = 0;
@@ -598,7 +611,7 @@ export class Renderer {
 
   private writeUniforms(cam: OrbitCamera): void {
     const d = this.uniformData;
-    const t = (performance.now() - this.startTime) / 1000;
+    const t = this.frozenClock >= 0 ? this.frozenClock : (performance.now() - this.startTime) / 1000;
     // row 0: camPos.xyz, fovScale
     d[0] = cam.position.x; d[1] = cam.position.y; d[2] = cam.position.z; d[3] = cam.fovScale;
     // row 1: forward.xyz, aspect
@@ -606,7 +619,8 @@ export class Renderer {
     // row 2: right.xyz, frame
     d[8] = cam.right.x; d[9] = cam.right.y; d[10] = cam.right.z; d[11] = this.frame;
     // row 3: up.xyz, seed
-    d[12] = cam.up.x; d[13] = cam.up.y; d[14] = cam.up.z; d[15] = Math.random();
+    d[12] = cam.up.x; d[13] = cam.up.y; d[14] = cam.up.z;
+    d[15] = this.frozenSeed >= 0 ? this.frozenSeed : Math.random();
     // row 4: sunDir.xyz, time
     d[16] = this.sunDir.x; d[17] = this.sunDir.y; d[18] = this.sunDir.z; d[19] = t;
     // row 5: res.xy, sampleCount, pad
@@ -619,8 +633,10 @@ export class Renderer {
     d[32] = this.sunColorV.x; d[33] = this.sunColorV.y; d[34] = this.sunColorV.z; d[35] = this.starsFlag;
     // row 9: aperture, focusDistance, giBounces, shaftStr
     d[36] = this.aperture; d[37] = this.focusDistance; d[38] = this.giBounces; d[39] = this.shaftStr;
-    // row 10: particleCount, shutter, pad, pad
-    d[40] = this.particleCount; d[41] = this.shutter; d[42] = 0; d[43] = 0;
+    // row 10: particleCount, shutter, tileY0, tileY1 (band this dispatch covers;
+    // the whole frame unless a tiled sample is in flight)
+    d[40] = this.particleCount; d[41] = this.shutter;
+    d[42] = this.tileY0; d[43] = this.tileY1 > 0 ? this.tileY1 : this.height;
     // row 11: particle bounding sphere (cx, cy, cz, radius)
     d[44] = this.partBound[0]; d[45] = this.partBound[1]; d[46] = this.partBound[2]; d[47] = this.partBound[3];
     this.device.queue.writeBuffer(this.uniformBuffer, 0, d);
@@ -628,18 +644,67 @@ export class Renderer {
 
   /** Trace one new sample per pixel and present the running average. */
   renderSample(cam: OrbitCamera): void {
-    this.writeUniforms(cam);
+    // The first sample of an image is the one that trips driver watchdogs:
+    // shader caches are cold, and it often lands while mesh/texture uploads are
+    // still draining the queue. Split it into scanline bands, each its own
+    // submission, so no single dispatch runs long enough to be reset. Later
+    // samples are cheap by comparison and go out whole.
+    const bands = this.frame === 0 ? this.warmupBands() : 1;
+    if (bands > 1) this.traceBanded(cam, bands);
+    else this.traceBand(cam, 0, this.height);
+
+    this.presentFrame();
+    this.frame++;
+  }
+
+  /** How many bands to split the first sample into: roughly one per
+   *  WARMUP_BAND_PIXELS, capped so a band is never thinner than a workgroup. */
+  private warmupBands(): number {
+    const want = Math.ceil((this.width * this.height) / WARMUP_BAND_PIXELS);
+    return Math.max(1, Math.min(want, Math.ceil(this.height / 8)));
+  }
+
+  /** Trace one sample as `bands` separately-submitted horizontal strips. Time
+   *  and RNG seed are frozen across the strips so they sample the same instant
+   *  and don't seam. */
+  private traceBanded(cam: OrbitCamera, bands: number): void {
+    this.frozenClock = (performance.now() - this.startTime) / 1000;
+    this.frozenSeed = Math.random();
+    try {
+      const rows = Math.ceil(this.height / bands / 8) * 8; // whole workgroups
+      for (let y = 0; y < this.height; y += rows) {
+        this.traceBand(cam, y, Math.min(this.height, y + rows));
+      }
+    } finally {
+      this.frozenClock = -1;
+      this.frozenSeed = -1;
+    }
+  }
+
+  /** Dispatch the tracer over scanlines [y0, y1) as its own submission. */
+  private traceBand(cam: OrbitCamera, y0: number, y1: number): void {
+    this.tileY0 = y0;
+    this.tileY1 = y1;
+    try {
+      this.writeUniforms(cam); // queue-ordered with the dispatch below
+      const encoder = this.device.createCommandEncoder();
+      const cpass = encoder.beginComputePass();
+      cpass.setPipeline(this.computePipeline);
+      cpass.setBindGroup(0, this.computeBind);
+      cpass.dispatchWorkgroups(Math.ceil(this.width / 8), Math.ceil((y1 - y0) / 8));
+      cpass.end();
+      this.device.queue.submit([encoder.finish()]);
+    } finally {
+      // Leave the uniform fields describing a whole frame — pick() and the
+      // offline render path share writeUniforms.
+      this.tileY0 = 0;
+      this.tileY1 = 0;
+    }
+  }
+
+  /** Resolve the accumulation buffer to the canvas. */
+  private presentFrame(): void {
     const encoder = this.device.createCommandEncoder();
-
-    const cpass = encoder.beginComputePass();
-    cpass.setPipeline(this.computePipeline);
-    cpass.setBindGroup(0, this.computeBind);
-    cpass.dispatchWorkgroups(
-      Math.ceil(this.width / 8),
-      Math.ceil(this.height / 8),
-    );
-    cpass.end();
-
     const rpass = encoder.beginRenderPass({
       colorAttachments: [
         {
@@ -654,8 +719,6 @@ export class Renderer {
     rpass.setBindGroup(0, this.presentBind);
     rpass.draw(3);
     rpass.end();
-
     this.device.queue.submit([encoder.finish()]);
-    this.frame++;
   }
 }
