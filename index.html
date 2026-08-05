@@ -41,6 +41,29 @@
         border-radius: var(--radius-sm); padding: 7px 11px; pointer-events: none;
         backdrop-filter: blur(6px); white-space: pre;
       }
+      /* shader-compile progress (sits just above the HUD, bottom-right) */
+      #compile {
+        position: fixed; bottom: 62px; right: 12px; width: 210px;
+        display: none; /* shown by main.ts only if the compile is slow enough to notice */
+        font: 11px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: var(--txt); background: var(--bg);
+        border: 1px solid var(--line); border-radius: var(--radius-sm);
+        padding: 8px 11px; pointer-events: none;
+        backdrop-filter: blur(6px); transition: opacity 0.5s;
+      }
+      #compile .c-row { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+      #compile .c-time { opacity: 0.55; font-variant-numeric: tabular-nums; }
+      #compile .c-track {
+        height: 4px; border-radius: 2px; overflow: hidden;
+        background: rgba(120, 170, 255, 0.15);
+      }
+      #compile .c-fill {
+        height: 100%; width: 0%; border-radius: 2px;
+        background: linear-gradient(90deg, rgba(120, 170, 255, 0.7), rgba(160, 220, 255, 0.95));
+        transition: width 0.25s linear;
+      }
+      #compile .c-note { margin-top: 6px; opacity: 0.45; }
+
       #err {
         position: fixed; inset: 0; display: none; place-items: center;
         font: 14px/1.6 ui-monospace, monospace; color: #ffb4b4;
@@ -384,6 +407,11 @@
     <canvas id="overlay"></canvas>
     <div id="menubar"></div>
     <div id="hud"></div>
+    <div id="compile">
+      <div class="c-row"><span>Compiling ray tracer…</span><span class="c-time">0s</span></div>
+      <div class="c-track"><div class="c-fill"></div></div>
+      <div class="c-note">Preview is live meanwhile.</div>
+    </div>
     <div id="panel" class="panel"></div>
     <div id="scenePanel" class="panel"></div>
     <div id="labsPanel" class="panel"></div>

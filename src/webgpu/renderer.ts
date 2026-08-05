@@ -7,8 +7,10 @@ import { MAX_PARTICLES, PARTICLE_FLOATS } from "../gen/particles";
 import { buildTLAS, refitTLAS } from "../mesh/bvh";
 import { Vector3, Matrix4 } from "three";
 
-// Uniform buffer is 12 rows of vec4 = 192 bytes. Keep in sync with the WGSL structs.
-const UNIFORM_FLOATS = 48;
+// Uniform buffer is 13 rows of vec4 = 208 bytes. Keep in sync with the WGSL
+// structs. present.wgsl declares only rows 0-7 and reads no further, so
+// tracer-only fields are appended past there.
+const UNIFORM_FLOATS = 52;
 const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 const PRIM_BYTES = MAX_PRIMS * 36 * 4;
 const LIGHT_BYTES = MAX_LIGHTS * LIGHT_FLOATS * 4;
@@ -18,6 +20,10 @@ const PARTICLE_BYTES = MAX_PARTICLES * PARTICLE_FLOATS * 4;
 // tracing a cold scene, while staying coarse enough that the extra submissions
 // cost nothing measurable.
 const WARMUP_BAND_PIXELS = 1 << 20;
+// Samples to submit between queue fences in the offline (thumbnail / export)
+// render path. Without a fence the whole batch lands in the queue at once and a
+// slow GPU can sit in one uninterruptible run long enough to be reset.
+const OFFLINE_FENCE_EVERY = 8;
 
 export class Renderer {
   private accumBuffer!: GPUBuffer;
@@ -28,13 +34,16 @@ export class Renderer {
   private bvhBuffer: GPUBuffer;
   private matBuffer: GPUBuffer;
   private instBuffer: GPUBuffer;
-  private tlasBuffer: GPUBuffer;      // TLAS nodes (BVH over instance world AABBs)
-  private tlasOrderBuffer: GPUBuffer; // instance indices in TLAS leaf order
   // CPU-side copy of the last-built TLAS, kept so a transform-only change (drag)
   // can refit the tree in place instead of doing a full rebuild + sort.
   private tlasNodesCPU = new Float32Array(8);
   private tlasOrderCPU = new Uint32Array(1);
   private tlasBuiltCount = -1; // instance count the current topology was built for
+  // The TLAS shares `bvhBuffer` with the per-mesh BLASes rather than binding its
+  // own storage buffer — identical node layout, and one fewer binding against
+  // GPUs that only allow 10 per stage. Layout: [BLAS nodes | TLAS nodes | slack].
+  private blasNodeFloats = 8;  // where the TLAS starts (floats into bvhBuffer)
+  private tlasCapFloats = 8;   // floats reserved for the TLAS after the BLASes
   private meshTexture: GPUTexture;
   private meshNormalTex: GPUTexture;
   private primTexture: GPUTexture;
@@ -67,7 +76,14 @@ export class Renderer {
   private shaftStr = 0;
   // 6 base + 3 star + 3 terrain-color + 3 recipe vec4 + MAX_CLOUD_LAYERS × 3 vec4.
   private readonly worldData = new Float32Array((15 + MAX_CLOUD_LAYERS * 3) * 4);
-  private computePipeline: GPUComputePipeline;
+  // The tracer pipeline is compiled asynchronously: the WGSL parses in ~30ms but
+  // the backend compile of a shader this size runs tens of seconds, and building
+  // it synchronously froze the whole page on startup — including the raster
+  // preview, which never dispatches it. Null until `ready` resolves; every path
+  // that needs it either waits or skips a frame.
+  private computePipeline: GPUComputePipeline | null = null;
+  /** Resolves once the tracer pipeline has finished compiling. */
+  readonly ready: Promise<void>;
   private presentPipeline: GPURenderPipeline;
   private presentModule!: GPUShaderModule;
   private computeBind!: GPUBindGroup;
@@ -109,11 +125,10 @@ export class Renderer {
     // Mesh buffers start as minimal placeholders (always bound, even with no mesh).
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     this.triBuffer = device.createBuffer({ size: 128, usage: storage });
-    this.bvhBuffer = device.createBuffer({ size: 32, usage: storage });
+    // 2 placeholder nodes: one BLAS root, one TLAS root.
+    this.bvhBuffer = device.createBuffer({ size: 64, usage: storage });
     this.matBuffer = device.createBuffer({ size: 48, usage: storage });
     this.instBuffer = device.createBuffer({ size: 80, usage: storage });
-    this.tlasBuffer = device.createBuffer({ size: 32, usage: storage }); // 1 placeholder node
-    this.tlasOrderBuffer = device.createBuffer({ size: 4, usage: storage });
     this.meshTexture = this.makeTexture(1, 1);
     this.meshNormalTex = this.makeTexture(1, 1);
     this.primTexture = this.makeTexture(1, 1);
@@ -142,10 +157,17 @@ export class Renderer {
     });
 
     const computeModule = device.createShaderModule({ code: raytraceWGSL });
-    this.computePipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module: computeModule, entryPoint: "main" },
-    });
+    this.ready = device
+      .createComputePipelineAsync({
+        layout: "auto",
+        compute: { module: computeModule, entryPoint: "main" },
+      })
+      .then((pipeline) => {
+        this.computePipeline = pipeline;
+        // The bind group could not be built without a layout; catch it up now
+        // with whatever resources the app uploaded while we were compiling.
+        this.rebuildComputeBind();
+      });
 
     const presentModule = device.createShaderModule({ code: presentWGSL });
     this.presentModule = presentModule;
@@ -207,13 +229,14 @@ export class Renderer {
       { binding: 11, resource: this.meshNormalTex.createView({ dimension: "2d-array" }) },
       { binding: 12, resource: { buffer: this.worldBuffer } },
       { binding: 13, resource: this.primTexture.createView({ dimension: "2d-array" }) },
-      { binding: 14, resource: { buffer: this.tlasBuffer } },
-      { binding: 15, resource: { buffer: this.tlasOrderBuffer } },
       { binding: 16, resource: { buffer: this.particleBuffer } },
     ];
   }
 
   private rebuildComputeBind(): void {
+    // No pipeline yet → no layout to bind against. Every upload path calls this,
+    // so the pipeline's own continuation rebuilds once when it lands.
+    if (!this.computePipeline) return;
     this.computeBind = this.device.createBindGroup({
       layout: this.computePipeline.getBindGroupLayout(0),
       entries: this.computeEntries(this.accumBuffer),
@@ -224,6 +247,7 @@ export class Renderer {
   /** Render one fully-accumulated frame off-screen at an arbitrary size and
    *  return its RGBA pixels (used by PNG export and the turntable recorder). */
   async renderToPixels(cam: OrbitCamera, w: number, h: number, samples: number): Promise<Uint8ClampedArray<ArrayBuffer>> {
+    await this.ready;
     const dev = this.device;
     const accum = dev.createBuffer({ size: w * h * 16, usage: GPUBufferUsage.STORAGE });
     const tex = dev.createTexture({
@@ -238,7 +262,7 @@ export class Renderer {
       primitive: { topology: "triangle-list" },
     });
     const computeBind = dev.createBindGroup({
-      layout: this.computePipeline.getBindGroupLayout(0),
+      layout: this.computePipeline!.getBindGroupLayout(0),
       entries: this.computeEntries(accum),
     });
     const presentBind = dev.createBindGroup({
@@ -258,11 +282,15 @@ export class Renderer {
       this.writeUniforms(cam); // queue-ordered with the dispatch below
       const enc = dev.createCommandEncoder();
       const cp = enc.beginComputePass();
-      cp.setPipeline(this.computePipeline);
+      cp.setPipeline(this.computePipeline!);
       cp.setBindGroup(0, computeBind);
       cp.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
       cp.end();
       dev.queue.submit([enc.finish()]);
+      // Drain periodically instead of dumping every sample into the queue at
+      // once: a gallery refresh is 6 scenes × 80 samples, and an unbroken run
+      // that long is what gets a slow GPU reset out from under us.
+      if ((i + 1) % OFFLINE_FENCE_EVERY === 0) await dev.queue.onSubmittedWorkDone();
     }
 
     const bytesPerRow = Math.ceil((w * 4) / 256) * 256;
@@ -394,6 +422,7 @@ export class Renderer {
   /** Trace one ray through a pixel and return the hit { kind, index }.
    *  kind: 0 miss, 1 terrain, 2 water, 4 primitive, 5 mesh. */
   async pick(cam: OrbitCamera, px: number, py: number): Promise<{ kind: number; index: number; dist: number }> {
+    await this.ready; // picking is a tracer dispatch
     this.pickX = px;
     this.pickY = py;
     this.writeUniforms(cam);
@@ -402,7 +431,7 @@ export class Renderer {
 
     const encoder = this.device.createCommandEncoder();
     const cpass = encoder.beginComputePass();
-    cpass.setPipeline(this.computePipeline);
+    cpass.setPipeline(this.computePipeline!);
     cpass.setBindGroup(0, this.computeBind);
     cpass.dispatchWorkgroups(Math.ceil(this.width / 8), Math.ceil(this.height / 8));
     cpass.end();
@@ -455,21 +484,20 @@ export class Renderer {
     }
 
     const triData = new Float32Array(Math.max(32, triFloats));
-    const nodeData = new Float32Array(Math.max(8, nodeFloats));
     let to = 0;
-    let no = 0;
     for (const b of blases) {
       triData.set(b.tris, to); to += b.tris.length;
-      nodeData.set(b.nodes, no); no += b.nodes.length;
     }
 
     this.triBuffer.destroy();
     this.triBuffer = this.device.createBuffer({ size: triData.byteLength, usage: storage });
     this.device.queue.writeBuffer(this.triBuffer, 0, triData);
 
-    this.bvhBuffer.destroy();
-    this.bvhBuffer = this.device.createBuffer({ size: nodeData.byteLength, usage: storage });
-    this.device.queue.writeBuffer(this.bvhBuffer, 0, nodeData);
+    // BLAS nodes go at the head of the shared node pool; uploadInstances (below)
+    // writes the TLAS into the region reserved after them.
+    this.blasNodeFloats = Math.max(8, nodeFloats);
+    this.allocNodePool();
+    this.writeBlasNodes(scene);
 
     const matData = new Float32Array(Math.max(12, scene.meshMaterials.length));
     matData.set(scene.meshMaterials);
@@ -482,6 +510,26 @@ export class Renderer {
     this.meshNormalTex = this.uploadTexArray(scene.meshNormalLayers, size, this.meshNormalTex);
 
     this.uploadInstances(scene); // also rebuilds the bind group
+  }
+
+  /** (Re)allocate the shared node pool: BLAS nodes followed by the TLAS region. */
+  private allocNodePool(): void {
+    this.bvhBuffer.destroy();
+    this.bvhBuffer = this.device.createBuffer({
+      size: (this.blasNodeFloats + this.tlasCapFloats) * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  /** Write every BLAS's nodes into the head of the pool, back to back. Written
+   *  per-BLAS straight from the scene rather than via one concatenated staging
+   *  array — the pool can be tens of MB on a heavy import. */
+  private writeBlasNodes(scene: Scene): void {
+    let o = 0;
+    for (const b of scene.blases) {
+      this.device.queue.writeBuffer(this.bvhBuffer, o * 4, b.nodes);
+      o += b.nodes.length;
+    }
   }
 
   /** Rewrite just the material buffer (cheap — call on a PBR override edit). */
@@ -529,11 +577,6 @@ export class Renderer {
       mins[i * 3] = miX; mins[i * 3 + 1] = miY; mins[i * 3 + 2] = miZ;
       maxs[i * 3] = maX; maxs[i * 3 + 1] = maY; maxs[i * 3 + 2] = maZ;
     }
-    if (data.byteLength > this.instBuffer.size) {
-      this.instBuffer.destroy();
-      this.instBuffer = this.device.createBuffer({ size: data.byteLength, usage: storage });
-    }
-    this.device.queue.writeBuffer(this.instBuffer, 0, data);
     this.instCount = insts.length;
 
     // Refresh the TLAS. When the instance set is structurally unchanged (a pure
@@ -546,19 +589,28 @@ export class Renderer {
       this.tlasNodesCPU = tlas.nodes;
       this.tlasOrderCPU = tlas.order;
       this.tlasBuiltCount = insts.length;
-      if (tlas.order.byteLength > this.tlasOrderBuffer.size) {
-        this.tlasOrderBuffer.destroy();
-        this.tlasOrderBuffer = this.device.createBuffer({ size: tlas.order.byteLength, usage: storage });
-      }
-      this.device.queue.writeBuffer(this.tlasOrderBuffer, 0, tlas.order); // order only changes on rebuild
     } else {
       refitTLAS(this.tlasNodesCPU, this.tlasOrderCPU, this.tlasNodesCPU.length / 8, mins, maxs);
     }
-    if (this.tlasNodesCPU.byteLength > this.tlasBuffer.size) {
-      this.tlasBuffer.destroy();
-      this.tlasBuffer = this.device.createBuffer({ size: this.tlasNodesCPU.byteLength, usage: storage });
+
+    // The TLAS leaf order rides in each instance's info.z (see Inst in the WGSL).
+    // Written before the upload below, so both land in one writeBuffer.
+    for (let i = 0; i < insts.length; i++) data[i * 20 + 18] = this.tlasOrderCPU[i] ?? 0;
+
+    if (data.byteLength > this.instBuffer.size) {
+      this.instBuffer.destroy();
+      this.instBuffer = this.device.createBuffer({ size: data.byteLength, usage: storage });
     }
-    this.device.queue.writeBuffer(this.tlasBuffer, 0, this.tlasNodesCPU);
+    this.device.queue.writeBuffer(this.instBuffer, 0, data);
+
+    // Grow the pool's TLAS region if this tree outgrew it. Reallocating drops the
+    // BLAS nodes with it, so they get rewritten; doubling keeps that rare.
+    if (this.tlasNodesCPU.length > this.tlasCapFloats) {
+      this.tlasCapFloats = this.tlasNodesCPU.length * 2;
+      this.allocNodePool();
+      this.writeBlasNodes(scene);
+    }
+    this.device.queue.writeBuffer(this.bvhBuffer, this.blasNodeFloats * 4, this.tlasNodesCPU);
 
     this.rebuildComputeBind();
     this.resetAccumulation();
@@ -639,11 +691,21 @@ export class Renderer {
     d[42] = this.tileY0; d[43] = this.tileY1 > 0 ? this.tileY1 : this.height;
     // row 11: particle bounding sphere (cx, cy, cz, radius)
     d[44] = this.partBound[0]; d[45] = this.partBound[1]; d[46] = this.partBound[2]; d[47] = this.partBound[3];
+    // row 12: tlasBase — node index where the TLAS starts inside the shared pool
+    d[48] = this.blasNodeFloats / 8; d[49] = 0; d[50] = 0; d[51] = 0;
     this.device.queue.writeBuffer(this.uniformBuffer, 0, d);
   }
 
-  /** Trace one new sample per pixel and present the running average. */
+  /** Whether the tracer pipeline has finished compiling and can be dispatched. */
+  get tracerReady(): boolean {
+    return this.computePipeline !== null;
+  }
+
+  /** Trace one new sample per pixel and present the running average. Silently
+   *  does nothing until the tracer pipeline is compiled; the frame loop keeps
+   *  calling, so tracing starts on its own the moment it lands. */
   renderSample(cam: OrbitCamera): void {
+    if (!this.computePipeline) return;
     // The first sample of an image is the one that trips driver watchdogs:
     // shader caches are cold, and it often lands while mesh/texture uploads are
     // still draining the queue. Split it into scanline bands, each its own
@@ -689,7 +751,7 @@ export class Renderer {
       this.writeUniforms(cam); // queue-ordered with the dispatch below
       const encoder = this.device.createCommandEncoder();
       const cpass = encoder.beginComputePass();
-      cpass.setPipeline(this.computePipeline);
+      cpass.setPipeline(this.computePipeline!);
       cpass.setBindGroup(0, this.computeBind);
       cpass.dispatchWorkgroups(Math.ceil(this.width / 8), Math.ceil((y1 - y0) / 8));
       cpass.end();

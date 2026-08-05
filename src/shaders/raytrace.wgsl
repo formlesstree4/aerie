@@ -18,6 +18,7 @@ struct Uniforms {
   aperture  : f32,  focusDist   : f32, giBounces : f32, shaftStr : f32,  // thin-lens DoF; giBounces = indirect diffuse bounces; shaftStr = god-ray strength
   partCount : f32,  shutter     : f32, tileY0 : f32, tileY1 : f32,  // particle count; shutter = motion-blur time (1/fps, 0 = none); [tileY0,tileY1) = scanline band this dispatch covers
   partBound : vec3f, partRadius : f32,  // bounding sphere over all live particles (whole-cloud ray reject)
+  tlasBase  : f32,  _p2 : f32, _p3 : f32, _p4 : f32,  // node index where the TLAS starts inside `nodes` (see below)
 };
 
 struct Tri {
@@ -40,7 +41,11 @@ struct Mtl {
 
 struct Inst {
   invModel : mat4x4f,  // world -> local
-  info     : vec4f,    // nodeBase, triBase, _, _
+  // z carries the TLAS leaf order: entry j of this array is the instance index
+  // the j'th TLAS leaf slot refers to. It rides here (rather than in a buffer of
+  // its own) purely to stay under tight maxStorageBuffersPerShaderStage limits —
+  // it is a parallel array, unrelated to the instance it is stored on.
+  info     : vec4f,    // nodeBase, triBase, tlasOrder[j], _
 };
 
 struct Prim {
@@ -94,11 +99,13 @@ fn lightRadius(lt: Light) -> f32 {
 @group(0) @binding(10) var<storage, read> instances : array<Inst>;
 @group(0) @binding(11) var meshNormalTex : texture_2d_array<f32>;
 @group(0) @binding(13) var primTex : texture_2d_array<f32>;
-// Top-level acceleration structure: a BVH over instance world AABBs. Same node
-// layout as a BLAS, but a leaf's `lo.w` (first) indexes `tlasOrder` (instance
-// indices) rather than the triangle pool.
-@group(0) @binding(14) var<storage, read> tlasNodes : array<Node>;
-@group(0) @binding(15) var<storage, read> tlasOrder : array<u32>;
+// Top-level acceleration structure: a BVH over instance world AABBs. It shares
+// the `nodes` pool with the per-mesh BLASes — identical 8-float layout — and
+// lives after them, starting at node `u.tlasBase`. Node-to-node references
+// inside it are TLAS-relative, so `tlasNode` rebases them. A leaf's `lo.w`
+// (first) indexes the leaf order in `instances[].info.z`, not the triangle pool.
+fn tlasNode(i: u32) -> Node { return nodes[u32(u.tlasBase) + i]; }
+fn tlasOrder(j: u32) -> u32 { return u32(instances[j].info.z); }
 // Emissive particle field (campfires, explosions, …). Each particle is an
 // additive glowing blob; see particleEmission(). p0 = pos.xyz + radius,
 // p1 = color.rgb (HDR) + opacity, p2 = velocity.xyz + pad (for motion blur).
@@ -938,13 +945,13 @@ fn traceInstances(ro: vec3f, rd: vec3f, tMax: f32) -> MeshHit {
 
   while (sp > 0) {
     sp = sp - 1;
-    let node = tlasNodes[stack[sp]];
+    let node = tlasNode(stack[sp]);
     if (!slabHit(ro, invD, node.lo.xyz, node.hi.xyz, best.t)) { continue; }
     let count = i32(node.hi.w);
     if (count > 0) {
       let first = u32(node.lo.w);
       for (var k = 0u; k < u32(count); k = k + 1u) {
-        let ii = tlasOrder[first + k];
+        let ii = tlasOrder(first + k);
         let inst = instances[ii];
         let rol = (inst.invModel * vec4f(ro, 1.0)).xyz;
         let rdl = (inst.invModel * vec4f(rd, 0.0)).xyz; // unnormalized → t preserved
@@ -958,8 +965,10 @@ fn traceInstances(ro: vec3f, rd: vec3f, tMax: f32) -> MeshHit {
       // child first so best.t tightens before the farther subtree is tested.
       let li = u32(node.lo.w);
       let ri = u32(-count - 1);
-      let lEnter = slabEnter(ro, invD, tlasNodes[li].lo.xyz, tlasNodes[li].hi.xyz, best.t);
-      let rEnter = slabEnter(ro, invD, tlasNodes[ri].lo.xyz, tlasNodes[ri].hi.xyz, best.t);
+      let lNode = tlasNode(li);
+      let rNode = tlasNode(ri);
+      let lEnter = slabEnter(ro, invD, lNode.lo.xyz, lNode.hi.xyz, best.t);
+      let rEnter = slabEnter(ro, invD, rNode.lo.xyz, rNode.hi.xyz, best.t);
       var nearI = li; var nearE = lEnter; var farI = ri; var farE = rEnter;
       if (rEnter < lEnter) { nearI = ri; nearE = rEnter; farI = li; farE = lEnter; }
       if (farE < NO_HIT && sp < 31) { stack[sp] = farI; sp = sp + 1; }
@@ -1084,13 +1093,13 @@ fn tlasOccluded(o: vec3f, ldir: vec3f, maxDist: f32) -> bool {
 
   while (sp > 0) {
     sp = sp - 1;
-    let node = tlasNodes[stack[sp]];
+    let node = tlasNode(stack[sp]);
     if (!slabHit(o, invD, node.lo.xyz, node.hi.xyz, maxDist)) { continue; }
     let count = i32(node.hi.w);
     if (count > 0) {
       let first = u32(node.lo.w);
       for (var k = 0u; k < u32(count); k = k + 1u) {
-        let ii = tlasOrder[first + k];
+        let ii = tlasOrder(first + k);
         let inst = instances[ii];
         let rol = (inst.invModel * vec4f(o, 1.0)).xyz;
         let rdl = (inst.invModel * vec4f(ldir, 0.0)).xyz;

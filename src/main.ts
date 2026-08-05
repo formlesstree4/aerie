@@ -33,6 +33,48 @@ function fail(msg: string): never {
   throw new Error(msg);
 }
 
+/**
+ * Show progress while the tracer's compute pipeline compiles.
+ *
+ * The backend compile of raytrace.wgsl runs tens of seconds cold (the WGSL parse
+ * is milliseconds — it's the driver's turn that costs), and WebGPU exposes no
+ * progress signal for it: the pipeline promise simply resolves when it's done.
+ * So the bar is driven by elapsed time on a decaying curve that approaches, but
+ * never reaches, full until the promise actually lands. It's an honest "still
+ * working, roughly this far in", not a real completion percentage.
+ */
+function trackShaderCompile(renderer: Renderer): void {
+  const box = document.getElementById("compile") as HTMLDivElement;
+  const fill = box.querySelector(".c-fill") as HTMLDivElement;
+  const timeEl = box.querySelector(".c-time") as HTMLSpanElement;
+  const start = performance.now();
+  let done = false;
+  const TAU = 32000; // ms; ~63% at 32s, ~85% at 60s, ~98% at 2min
+
+  // Warm loads hit the driver's shader cache and finish almost instantly — only
+  // surface the panel if it's still going after a beat, so it never just blinks.
+  const reveal = setTimeout(() => { if (!done) box.style.display = "block"; }, 400);
+
+  const tick = window.setInterval(() => {
+    const t = performance.now() - start;
+    fill.style.width = `${(1 - Math.exp(-t / TAU)) * 100}%`;
+    timeEl.textContent = `${Math.round(t / 1000)}s`;
+  }, 250);
+
+  renderer.ready.then(() => {
+    done = true;
+    clearTimeout(reveal);
+    window.clearInterval(tick);
+    if (box.style.display !== "block") return; // never shown — nothing to wind down
+    fill.style.width = "100%";
+    timeEl.textContent = `${((performance.now() - start) / 1000).toFixed(1)}s`;
+    (box.querySelector(".c-row > span") as HTMLSpanElement).textContent = "Ray tracer ready";
+    (box.querySelector(".c-note") as HTMLDivElement).textContent = "Press Render to trace.";
+    setTimeout(() => { box.style.opacity = "0"; }, 1400);
+    setTimeout(() => { box.style.display = "none"; box.style.opacity = ""; }, 2000);
+  });
+}
+
 async function main() {
   if (!navigator.gpu) {
     // navigator.gpu is only exposed in a secure context: HTTPS, or plain HTTP
@@ -60,10 +102,12 @@ async function main() {
   });
   if (!adapter) fail("No suitable GPU adapter found.");
 
-  // The compute tracer binds 11 storage buffers (8 scene pools + TLAS nodes +
-  // TLAS order + the particle field); the spec only guarantees 8, so raise the
-  // limit to what the adapter actually supports.
-  const NEEDED_STORAGE_BUFFERS = 11;
+  // The compute tracer binds 9 storage buffers: accum, prims, lights, triangles,
+  // nodes, materials, pick, instances, particles. (The TLAS shares the `nodes`
+  // pool and its leaf order rides in `instances`, precisely to stay under the
+  // 10-per-stage limit some GPUs report.) The spec only guarantees 8, so raise
+  // the limit to what the adapter actually supports.
+  const NEEDED_STORAGE_BUFFERS = 9;
   const maxStorage = adapter.limits.maxStorageBuffersPerShaderStage;
   if (maxStorage < NEEDED_STORAGE_BUFFERS) {
     fail(
@@ -83,6 +127,7 @@ async function main() {
   context.configure({ device, format, alphaMode: "opaque" });
 
   const renderer = new Renderer(device, context, format);
+  trackShaderCompile(renderer);
   const cam = new OrbitCamera();
   const scene = defaultScene();
   const preview = new Preview(previewCanvas, scene);
@@ -3797,6 +3842,13 @@ async function main() {
     lastTime = now;
 
     const done = renderer.frame >= MAX_SAMPLES;
+    if (!renderer.tracerReady) {
+      // Switched to Render before the pipeline finished compiling; the panel
+      // above the HUD is already showing how far along it is.
+      hud.textContent = "Aerie · Render (ray-traced)\nwaiting on shader compile…";
+      requestAnimationFrame(frame);
+      return;
+    }
     hud.textContent =
       `Aerie · Render (ray-traced)${rebaked ? " · animating (1 sample/frame)" : ""}\n` +
       `${renderer.width}×${renderer.height} · ${Math.min(renderer.frame, MAX_SAMPLES)}/${MAX_SAMPLES}` +
